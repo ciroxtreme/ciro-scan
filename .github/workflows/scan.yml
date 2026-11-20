@@ -45,6 +45,8 @@ jobs:
         with:
           name: scan-report-json
           path: |
-            findings.json
+            findings_active.json
+            findings_potential.json
+            findings_noise.json
             scan_summary.txt
           if-no-files-found: ignore
