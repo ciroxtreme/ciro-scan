@@ -38,6 +38,62 @@ def send_telegram_document(file_path, caption=""):
     except Exception as e:
         print(f"[ERR] Send document failed: {e}")
 
+# --- Pemisah temuan: aktif / potensial / noise (aturan sama seperti split.py) ---
+PLACEHOLDER_HOSTS = {
+    "example.com", "www.example.com", "example.org", "example.net",
+    "proxy", "host", "localhost", "127.0.0.1",
+    "captchatest.book.bi", "y.ep",
+}
+
+def _uri_host(redacted):
+    m = re.search(r"@([^/:?#]+)", redacted or "")
+    return (m.group(1).lower() if m else "")
+
+def _is_placeholder_uri(redacted):
+    host = _uri_host(redacted)
+    if not host:
+        return True
+    if host in PLACEHOLDER_HOSTS:
+        return True
+    return host.endswith((".example.com", ".example.org", ".example.net",
+                          ".test", ".invalid", ".localhost"))
+
+def classify_finding(data):
+    """Kembalikan (bucket, reason): active / potential / noise."""
+    det = data.get("DetectorName") or data.get("DetectorType") or "?"
+    verified = data.get("Verified")
+    if verified is True:
+        return "active", "Verified live oleh TruffleHog (API layanan asli dikontak)"
+    meta = (data.get("SourceMetadata") or {}).get("Data") or {}
+    git = meta.get("Git") or meta.get("Github") or {}
+    fpath = git.get("file") or ""
+    redacted = (data.get("Redacted") or "").replace("\n", " ")
+    if det == "Box":
+        return "noise", "Box detector false positive"
+    if "vendor/" in fpath or "node_modules/" in fpath:
+        return "noise", "Dependency vendor / node_modules (bukan kode sendiri)"
+    if det == "PrivateKey" and "boringssl" in fpath:
+        return "noise", "Kunci test BoringSSL"
+    if det == "URI" and _is_placeholder_uri(redacted):
+        return "noise", "URI contoh/placeholder (example.com, user:pass@host, domain test)"
+    return "potential", "Belum terverifikasi tapi bentuknya kunci asli (lama/session/kredensial)"
+
+def safe_record(data, bucket, reason):
+    """Satu baris temuan AMAN (tanpa Raw/RawV2) untuk file JSON pisah."""
+    meta = (data.get("SourceMetadata") or {}).get("Data") or {}
+    git = meta.get("Git") or meta.get("Github") or {}
+    return {
+        "detector": data.get("DetectorName") or data.get("DetectorType") or "?",
+        "verified": bool(data.get("Verified")) if data.get("Verified") is not None else None,
+        "category": bucket,
+        "reason": reason,
+        "repo": data.get("_scanned_repo", ""),
+        "file": git.get("file") or "",
+        "line": git.get("line") or "",
+        "commit": (git.get("commit") or "")[:12],
+        "redacted": (data.get("Redacted") or "").replace("\n", " ")[:90],
+    }
+
 def resolve_target_repos(target_str):
     """
     Mendeteksi apakah target berupa:
@@ -139,12 +195,33 @@ def main():
             "total": repo_total
         })
 
-    # Simpan laporan json
+    # Simpan laporan json (mentah, hanya di runner — TIDAK dikirim/upload)
     with open("findings.json", "w") as f:
         json.dump(all_findings, f, indent=2)
 
+    # Pisah jadi 3 file AMAN (tanpa nilai kunci asli)
+    buckets = {"active": [], "potential": [], "noise": []}
+    seen_split = set()
+    for data in all_findings:
+        bucket, reason = classify_finding(data)
+        rec = safe_record(data, bucket, reason)
+        key = (rec["detector"], str(data.get("Verified")), rec["redacted"],
+               rec["repo"], rec["file"], str(rec["line"]), rec["commit"])
+        if key in seen_split:
+            continue
+        seen_split.add(key)
+        buckets[bucket].append(rec)
+    for bucket, rows in buckets.items():
+        rows.sort(key=lambda r: (r["detector"], r["repo"], r["file"]))
+        with open(f"findings_{bucket}.json", "w") as f:
+            json.dump(rows, f, indent=2, ensure_ascii=False)
+        print(f"📁 findings_{bucket}.json: {len(rows)} temuan")
+
     total_verified = len(verified_findings)
     total_leaks = len(all_findings)
+    total_active = len(buckets["active"])
+    total_potential = len(buckets["potential"])
+    total_noise = len(buckets["noise"])
 
     # Susun Pesan Ringkasan
     msg_lines = [
@@ -152,8 +229,10 @@ def main():
         "━━━━━━━━━━━━━━━━━━",
         f"🎯 <b>Target:</b> <code>{TARGET_INPUT}</code>",
         f"📦 <b>Repo Discan:</b> <b>{total_targets} repositori</b>",
-        f"🚨 <b>Verified Active Leaks:</b> <b>{total_verified}</b>",
-        f"⚠️ <b>Total Potensi Temuan:</b> {total_leaks}",
+        f"🚨 <b>Aktif (verified):</b> <b>{total_active}</b>",
+        f"⚠️ <b>Potensial:</b> {total_potential}",
+        f"🗑️ <b>Noise:</b> {total_noise}",
+        f"📊 <b>Total Temuan:</b> {total_leaks}",
         "━━━━━━━━━━━━━━━━━━"
     ]
 
@@ -166,17 +245,12 @@ def main():
                 icon = "❌" if s["verified"] > 0 else "✅"
                 msg_lines.append(f"{icon} <code>{s['repo']}</code> : <b>{s['verified']} aktif bocor</b> ({s['total']} potensi)")
 
-    if total_verified > 0:
+    if total_active > 0:
         msg_lines.append("\n🔥 <b>DETAIL TOKEN AKTIF BOCOR:</b>")
-        for i, f in enumerate(verified_findings[:15], 1):
-            det = f.get("DetectorName", "Unknown")
-            rname = f.get("_scanned_repo", "")
-            commit = f.get("SourceMetadata", {}).get("Data", {}).get("Git", {}).get("commit", "")[:8]
-            raw = f.get("Raw", "")
-            masked = raw[:8] + "..." + raw[-4:] if len(raw) > 12 else "***"
-            msg_lines.append(f"{i}. <b>[{det}]</b> di <code>{rname}</code> (commit: <code>{commit}</code>)\n   👉 Token: <code>{masked}</code>")
-        if total_verified > 15:
-            msg_lines.append(f"<i>...dan {total_verified - 15} temuan lainnya ada di file JSON terlampir.</i>")
+        for i, f in enumerate(buckets["active"][:15], 1):
+            msg_lines.append(f"{i}. <b>[{f['detector']}]</b> di <code>{f['repo']}</code> (commit: <code>{f['commit']}</code>)\n   👉 Token: <code>{f['redacted'][:40]}</code>")
+        if total_active > 15:
+            msg_lines.append(f"<i>...dan {total_active - 15} temuan lainnya ada di file JSON terlampir.</i>")
     elif failed_repos:
         msg_lines.append("\n⚠️ <b>STATUS: SCAN TIDAK LENGKAP!</b> Ada repo yang gagal discan — hasil di atas belum bisa dipercaya sebagai \"aman\".")
         for fr in failed_repos:
@@ -187,9 +261,12 @@ def main():
     report_text = "\n".join(msg_lines)
     send_telegram_text(report_text)
 
-    # Kirim file JSON jika ada temuan
-    if total_leaks > 0:
-        send_telegram_document("findings.json", f"📁 File JSON Temuan Audit ({TARGET_INPUT})")
+    # Kirim file JSON pisah (AMAN, tanpa nilai kunci asli) — aktif & potensial saja;
+    # noise hanya jadi artifact GitHub supaya tidak nge-spam Telegram
+    if total_active > 0:
+        send_telegram_document("findings_active.json", f"🚨 File JSON Temuan AKTIF ({total_active}) — {TARGET_INPUT}")
+    if total_potential > 0:
+        send_telegram_document("findings_potential.json", f"⚠️ File JSON Temuan POTENSIAL ({total_potential}) — {TARGET_INPUT}")
 
     if failed_repos:
         print(f"❌ {len(failed_repos)} repo gagal discan, keluar dengan error.")
