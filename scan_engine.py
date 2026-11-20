@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import re
 import subprocess
 import urllib.request
 import urllib.parse
@@ -94,13 +95,27 @@ def main():
     all_findings = []
     verified_findings = []
     repo_summaries = []
+    failed_repos = []
 
     for idx, repo_url in enumerate(targets, 1):
         repo_name = repo_url.split("/")[-1]
         print(f"[{idx}/{total_targets}] Scanning {repo_name} ({repo_url})...")
         cmd = ["trufflehog", "git", repo_url, "--json", "--no-update"]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError as e:
+            print(f"❌ Gagal menjalankan trufflehog untuk {repo_name}: {e}")
+            failed_repos.append({"repo": repo_name, "url": repo_url, "error": f"trufflehog tidak bisa dijalankan: {e}"})
+            repo_summaries.append({"repo": repo_name, "url": repo_url, "verified": 0, "total": 0, "failed": True})
+            continue
+
+        if res.returncode != 0:
+            err = (res.stderr or "").strip()[-300:]
+            print(f"❌ Scan GAGAL untuk {repo_name} (exit {res.returncode}): {err}")
+            failed_repos.append({"repo": repo_name, "url": repo_url, "error": err})
+            repo_summaries.append({"repo": repo_name, "url": repo_url, "verified": 0, "total": 0, "failed": True})
+            continue
+
         repo_verified = 0
         repo_total = 0
         raw_lines = res.stdout.strip().split("\n") if res.stdout.strip() else []
@@ -145,8 +160,11 @@ def main():
     if is_batch:
         msg_lines.append("\n📋 <b>RINGKASAN STATUS REPO:</b>")
         for s in repo_summaries:
-            icon = "❌" if s["verified"] > 0 else "✅"
-            msg_lines.append(f"{icon} <code>{s['repo']}</code> : <b>{s['verified']} aktif bocor</b> ({s['total']} potensi)")
+            if s.get("failed"):
+                msg_lines.append(f"⚠️ <code>{s['repo']}</code> : <b>SCAN GAGAL</b>")
+            else:
+                icon = "❌" if s["verified"] > 0 else "✅"
+                msg_lines.append(f"{icon} <code>{s['repo']}</code> : <b>{s['verified']} aktif bocor</b> ({s['total']} potensi)")
 
     if total_verified > 0:
         msg_lines.append("\n🔥 <b>DETAIL TOKEN AKTIF BOCOR:</b>")
@@ -159,6 +177,10 @@ def main():
             msg_lines.append(f"{i}. <b>[{det}]</b> di <code>{rname}</code> (commit: <code>{commit}</code>)\n   👉 Token: <code>{masked}</code>")
         if total_verified > 15:
             msg_lines.append(f"<i>...dan {total_verified - 15} temuan lainnya ada di file JSON terlampir.</i>")
+    elif failed_repos:
+        msg_lines.append("\n⚠️ <b>STATUS: SCAN TIDAK LENGKAP!</b> Ada repo yang gagal discan — hasil di atas belum bisa dipercaya sebagai \"aman\".")
+        for fr in failed_repos:
+            msg_lines.append(f"• <code>{fr['repo']}</code>: <code>{fr['error'][:200]}</code>")
     else:
         msg_lines.append("\n🏆 <b>STATUS: 100% AMAN!</b> Tidak ada kunci rahasia aktif yang bocor!")
 
@@ -168,6 +190,10 @@ def main():
     # Kirim file JSON jika ada temuan
     if total_leaks > 0:
         send_telegram_document("findings.json", f"📁 File JSON Temuan Audit ({TARGET_INPUT})")
+
+    if failed_repos:
+        print(f"❌ {len(failed_repos)} repo gagal discan, keluar dengan error.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
