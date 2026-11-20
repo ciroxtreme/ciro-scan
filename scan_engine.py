@@ -2,12 +2,29 @@ import sys
 import os
 import json
 import re
+import shutil
 import subprocess
+import tempfile
+import html
 import urllib.request
 import urllib.parse
 import requests
 
 TARGET_INPUT = sys.argv[1] if len(sys.argv) > 1 else os.getenv("TARGET_URL", "")
+
+def _parse_search_keyword():
+    """Ambil kata kunci pencarian teks bebas dari CLI (--search / -bebas) atau env."""
+    args = sys.argv[2:]
+    for i, a in enumerate(args):
+        if a in ("--search", "-bebas") and i + 1 < len(args):
+            return args[i + 1].strip()
+        if a.startswith("--search="):
+            return a[len("--search="):].strip()
+        if a.startswith("-bebas="):
+            return a[len("-bebas="):].strip()
+    return (os.getenv("SEARCH_KEYWORD", "") or "").strip()
+
+SEARCH_KEYWORD = _parse_search_keyword()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1936436999")
 GH_PAT = os.getenv("GH_PAT", "")
@@ -130,12 +147,161 @@ def resolve_target_repos(target_str):
     
     return [clean]
 
+# --- Pencarian teks bebas (-bebas): cari kata apa saja di seluruh history git ---
+MAX_MATCHES_PER_REPO = 100
+MAX_TOTAL_MATCHES = 500
+MAX_COMMITS_PER_REPO = 20
+
+def _search_category(fpath):
+    """Klasifikasi kecocokan teks: vendor/node_modules = noise, sisanya potential."""
+    if "vendor/" in fpath or "node_modules/" in fpath:
+        return "noise", "Kecocokan di dependency vendor / node_modules"
+    return "potential", "Kecocokan di kode sendiri"
+
+def search_text_in_repo(repo_url, keyword, repo_name):
+    """Clone repo lalu cari keyword (case-insensitive) di seluruh history.
+    Kembalikan (matches, error). matches = list dict {repo,file,line,commit,content,category,reason}."""
+    tmpdir = tempfile.mkdtemp(prefix="ciroscan-search-")
+    try:
+        clone = subprocess.run(
+            ["git", "clone", "--quiet", repo_url, tmpdir],
+            capture_output=True, text=True, timeout=600)
+        if clone.returncode != 0:
+            err = (clone.stderr or "").strip()[-300:]
+            return [], f"git clone gagal: {err}"
+        # 1) Commit mana saja yang diff-nya menyentuh keyword (case-insensitive, literal)
+        pattern = re.escape(keyword)
+        log = subprocess.run(
+            ["git", "-C", tmpdir, "log", "--all", "--pretty=format:%H", "-i", "-G", pattern],
+            capture_output=True, text=True, timeout=300)
+        if log.returncode != 0:
+            return [], f"git log gagal: {(log.stderr or '').strip()[-200:]}"
+        commits = [c.strip() for c in log.stdout.splitlines() if c.strip()][:MAX_COMMITS_PER_REPO]
+        matches = []
+        seen = set()
+        for commit in commits:
+            if len(matches) >= MAX_MATCHES_PER_REPO:
+                break
+            grep = subprocess.run(
+                ["git", "-C", tmpdir, "grep", "-n", "-i", "-F", "-e", keyword, commit, "--"],
+                capture_output=True, text=True, timeout=120)
+            if grep.returncode != 0:
+                continue
+            for line in grep.stdout.splitlines():
+                m = re.match(r"^([0-9a-f]{40}):(.+):(\d+):(.*)$", line)
+                if not m:
+                    continue
+                _, fpath, lineno, content = m.groups()
+                key = (fpath, lineno, content.strip())
+                if key in seen:
+                    continue
+                seen.add(key)
+                category, reason = _search_category(fpath)
+                matches.append({
+                    "repo": repo_name,
+                    "file": fpath,
+                    "line": int(lineno),
+                    "commit": commit[:12],
+                    "content": content.strip()[:200],
+                    "category": category,
+                    "reason": reason,
+                })
+                if len(matches) >= MAX_MATCHES_PER_REPO:
+                    break
+        return matches, ""
+    except subprocess.TimeoutExpired:
+        return [], "timeout saat clone/search (repo terlalu besar?)"
+    except OSError as e:
+        return [], f"gagal menjalankan git: {e}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+def run_text_search(targets, keyword):
+    """Mode -bebas: cari keyword di semua repo target, laporkan ke Telegram."""
+    total_targets = len(targets)
+    is_batch = total_targets > 1
+    send_telegram_text(
+        f"🔍 <b>PENCARIAN TEKS BEBAS DIMULAI!</b>\n\n🔎 <b>Kata kunci:</b> <code>{html.escape(keyword)}</code>\n"
+        f"🎯 <b>Target:</b> <code>{TARGET_INPUT}</code>\n📦 <b>Total Repositori:</b> <b>{total_targets} repo</b>\n"
+        f"⏳ <i>Sedang menyisir seluruh history commit...</i>")
+
+    all_matches = []
+    failed_repos = []
+    repo_summaries = []
+    for idx, repo_url in enumerate(targets, 1):
+        repo_name = repo_url.split("/")[-1]
+        print(f"[{idx}/{total_targets}] Searching '{keyword}' in {repo_name} ({repo_url})...")
+        matches, err = search_text_in_repo(repo_url, keyword, repo_name)
+        if err:
+            print(f"❌ Search GAGAL untuk {repo_name}: {err}")
+            failed_repos.append({"repo": repo_name, "url": repo_url, "error": err})
+            repo_summaries.append({"repo": repo_name, "matches": 0, "failed": True})
+            continue
+        all_matches.extend(matches)
+        repo_summaries.append({"repo": repo_name, "matches": len(matches), "failed": False})
+        print(f"   → {len(matches)} kecocokan di {repo_name}")
+
+    all_matches = all_matches[:MAX_TOTAL_MATCHES]
+    all_matches.sort(key=lambda r: (r["category"] != "potential", r["repo"], r["file"]))
+    with open("text_search_results.json", "w") as f:
+        json.dump(all_matches, f, indent=2, ensure_ascii=False)
+    print(f"📁 text_search_results.json: {len(all_matches)} kecocokan")
+
+    potential = [m for m in all_matches if m["category"] == "potential"]
+    noise = [m for m in all_matches if m["category"] == "noise"]
+
+    msg_lines = [
+        "🔍 <b>HASIL PENCARIAN TEKS BEBAS</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🔎 <b>Kata kunci:</b> <code>{html.escape(keyword)}</code>",
+        f"🎯 <b>Target:</b> <code>{TARGET_INPUT}</code>",
+        f"📦 <b>Repo Dicari:</b> <b>{total_targets} repositori</b>",
+        f"✅ <b>Kecocokan di kode sendiri:</b> <b>{len(potential)}</b>",
+        f"🗑️ <b>Kecocokan di vendor/noise:</b> {len(noise)}",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+    if is_batch:
+        msg_lines.append("\n📋 <b>PER REPO:</b>")
+        for s in repo_summaries:
+            if s.get("failed"):
+                msg_lines.append(f"⚠️ <code>{s['repo']}</code> : <b>SEARCH GAGAL</b>")
+            else:
+                msg_lines.append(f"• <code>{s['repo']}</code> : <b>{s['matches']} kecocokan</b>")
+    if potential:
+        msg_lines.append("\n📌 <b>KECOCOKAN (kode sendiri):</b>")
+        for m in potential[:15]:
+            msg_lines.append(
+                f"{m['repo']} <code>{m['file']}:{m['line']}</code> ({m['commit']})\n"
+                f"   👉 <code>{html.escape(m['content'][:120])}</code>")
+        if len(potential) > 15:
+            msg_lines.append(f"<i>...dan {len(potential) - 15} kecocokan lainnya ada di file JSON terlampir.</i>")
+    elif failed_repos:
+        msg_lines.append("\n⚠️ <b>STATUS: PENCARIAN TIDAK LENGKAP!</b> Ada repo yang gagal dicari.")
+        for fr in failed_repos:
+            msg_lines.append(f"• <code>{fr['repo']}</code>: <code>{html.escape(fr['error'][:200])}</code>")
+    else:
+        msg_lines.append(f"\n✅ <b>TIDAK KETEMU!</b> Kata <code>{html.escape(keyword)}</code> tidak muncul di repo manapun.")
+    send_telegram_text("\n".join(msg_lines))
+
+    if all_matches:
+        send_telegram_document("text_search_results.json",
+                               f"🔍 Hasil pencarian '{keyword}' ({len(all_matches)} kecocokan) — {TARGET_INPUT}")
+    if failed_repos:
+        print(f"❌ {len(failed_repos)} repo gagal dicari, keluar dengan error.")
+        sys.exit(1)
+
 def main():
     if not TARGET_INPUT:
         print("❌ Error: No target input provided.")
         sys.exit(1)
 
     targets = resolve_target_repos(TARGET_INPUT)
+
+    # Mode pencarian teks bebas: -bebas <keyword> (ganti TruffleHog untuk run ini)
+    if SEARCH_KEYWORD:
+        run_text_search(targets, SEARCH_KEYWORD)
+        return
+
     total_targets = len(targets)
 
     if total_targets == 0:

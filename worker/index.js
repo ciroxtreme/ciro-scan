@@ -15,12 +15,14 @@ export default {
 
     // 1. Endpoint HTTP GET/POST sederhana untuk scan via web browser / curl
     // Contoh: https://worker.dev/scan?url=https://github.com/target/repo
+    // Pencarian teks bebas: https://worker.dev/scan?url=https://github.com/owner&keyword=password
     if (url.pathname === "/scan") {
       const targetUrl = url.searchParams.get("url");
+      const keyword = url.searchParams.get("keyword") || "";
       if (!targetUrl) {
         return new Response("Missing 'url' parameter", { status: 400 });
       }
-      const triggered = await triggerGitHubScan(targetUrl, env);
+      const triggered = await triggerGitHubScan(targetUrl, env, keyword);
       if (triggered.ok) {
         return new Response(`🚀 Scan berhasil dipicu untuk: ${targetUrl}. Pantau hasil di Telegram!\n`);
       } else {
@@ -43,14 +45,27 @@ export default {
           }
 
           // Cek apakah pesan berisi link GitHub / git
+          // Format bebas: <url> [-bebas <kata kunci>] — contoh:
+          //   https://github.com/ciroxtreme/cdtt
+          //   https://github.com/ciroxtreme -bebas password
           if (text.startsWith("http://") || text.startsWith("https://") || text.startsWith("git@")) {
-            await sendTelegram(chatId, `🎯 Menerima URL: <code>${text}</code>\n🚀 Memicu GitHub Actions TruffleHog Scanner...`, env);
-            const res = await triggerGitHubScan(text, env);
+            const parts = text.split(/\s+/);
+            const targetUrl = parts[0];
+            let keyword = "";
+            const flagIdx = parts.findIndex((p) => p === "-bebas");
+            if (flagIdx !== -1 && parts[flagIdx + 1]) {
+              keyword = parts.slice(flagIdx + 1).join(" ");
+            }
+            const modeText = keyword
+              ? `🔍 Mode pencarian teks bebas: <code>${esc(keyword)}</code>`
+              : `🚀 Memicu GitHub Actions TruffleHog Scanner...`;
+            await sendTelegram(chatId, `🎯 Menerima URL: <code>${esc(targetUrl)}</code>\n${modeText}`, env);
+            const res = await triggerGitHubScan(targetUrl, env, keyword);
             if (!res.ok) {
-              await sendTelegram(chatId, `❌ Gagal memicu GitHub runner: <code>${res.error}</code>`, env);
+              await sendTelegram(chatId, `❌ Gagal memicu GitHub runner: <code>${esc(res.error)}</code>`, env);
             }
           } else if (text === "/start") {
-            await sendTelegram(chatId, `👋 Halo Tuan Ciro! 🐷\n\nKirimkan saja link repositori Git (contoh: <code>https://github.com/user/repo</code>) langsung ke chat ini.\n\nSaya akan otomatis memicu TruffleHog runner dan mengirimkan hasil audit bocoran token beserta file JSON-nya ke sini!`, env);
+            await sendTelegram(chatId, `👋 Halo Tuan Ciro! 🐷\n\nKirimkan saja link repositori Git (contoh: <code>https://github.com/user/repo</code>) langsung ke chat ini.\n\nSaya akan otomatis memicu TruffleHog runner dan mengirimkan hasil audit bocoran token beserta file JSON-nya ke sini!\n\n🔍 Mau cari kata bebas? Tambah <code>-bebas &lt;kata&gt;</code>, contoh:\n<code>https://github.com/ciroxtreme -bebas password</code>`, env);
           } else {
             await sendTelegram(chatId, `⚠️ Format salah. Kirimkan link URL Git yang valid (diawali https://github.com/...).`, env);
           }
@@ -65,7 +80,11 @@ export default {
   }
 };
 
-async function triggerGitHubScan(targetUrl, env) {
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+async function triggerGitHubScan(targetUrl, env, searchKeyword = "") {
   const owner = env.GH_OWNER || "ciroxtreme";
   const repo = env.GH_REPO || "ciro-scan";
   const workflow = "scan.yml";
@@ -82,7 +101,8 @@ async function triggerGitHubScan(targetUrl, env) {
       body: JSON.stringify({
         ref: "main",
         inputs: {
-          target_url: targetUrl
+          target_url: targetUrl,
+          search_keyword: searchKeyword || ""
         }
       })
     });
