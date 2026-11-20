@@ -7,11 +7,15 @@ on:
         description: 'URL target repo Git (contoh: https://github.com/user/repo)'
         required: true
         default: 'https://github.com/ciroxtreme/ciro-chamleon'
+      search_keyword:
+        description: 'Kata kunci pencarian teks bebas -bebas (kosongkan untuk scan TruffleHog biasa)'
+        required: false
+        default: ''
 
 jobs:
   trufflehog-scan:
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout Repo Scanner
         uses: actions/checkout@v4
@@ -34,6 +38,7 @@ jobs:
       - name: Execute Security Scan & Telegram Dispatch
         env:
           TARGET_URL: ${{ github.event.inputs.target_url }}
+          SEARCH_KEYWORD: ${{ github.event.inputs.search_keyword }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
@@ -48,4 +53,5 @@ jobs:
             findings_active.json
             findings_potential.json
             findings_noise.json
-            -no-files-found: ignore
+            text_search_results.json
+          if-no-files-found: ignore
