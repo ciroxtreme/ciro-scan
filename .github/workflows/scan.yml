@@ -48,5 +48,4 @@ jobs:
             findings_active.json
             findings_potential.json
             findings_noise.json
-            scan_summary.txt
-          if-no-files-found: ignore
+            -no-files-found: ignore
