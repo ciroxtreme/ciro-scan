@@ -1,0 +1,50 @@
+name: TruffleHog Security Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'URL target repo Git (contoh: https://github.com/user/repo)'
+        required: true
+        default: 'https://github.com/ciroxtreme/ciro-chamleon'
+
+jobs:
+  trufflehog-scan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Repo Scanner
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install --no-cache-dir requests
+
+      - name: Install Official TruffleHog
+        run: |
+          echo "📥 Mengunduh biner TruffleHog terbaru..."
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sudo sh -s -- -b /usr/local/bin
+          trufflehog --version
+
+      - name: Execute Security Scan & Telegram Dispatch
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -u scan_engine.py "$TARGET_URL"
+
+      - name: Upload Scan Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-report-json
+          path: |
+            findings.json
+            scan_summary.txt
+          if-no-files-found: ignore
