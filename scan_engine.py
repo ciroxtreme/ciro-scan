@@ -23,7 +23,9 @@ FEED_MODE = (
 FEED_EVENT_PAGES = int(os.getenv("FEED_EVENT_PAGES", "2"))        # halaman event disedot (100 event/halaman)
 FEED_MAX_USERS = int(os.getenv("FEED_MAX_USERS", "5"))            # maksimal berapa user yang dipicked
 FEED_MAX_REPOS_PER_USER = int(os.getenv("FEED_MAX_REPOS_PER_USER", "3"))  # maks repo per user
-FEED_MAX_TOTAL_REPOS = int(os.getenv("FEED_MAX_TOTAL_REPOS", "15"))        # total plafon repo per run
+FEED_MAX_TOTAL_REPOS = int(os.getenv("FEED_MAX_TOTAL_REPOS", "50"))        # total plafon repo per run (naik ke 50)
+REPO_SCAN_TIMEOUT = int(os.getenv("REPO_SCAN_TIMEOUT", "120"))               # timeout maks 2 menit (120 detik) per repo
+CONCURRENCY_WORKERS = int(os.getenv("CONCURRENCY_WORKERS", "4"))             # parallel multi-worker TruffleHog
 FEED_EXCLUDE = {u.strip().lower() for u in os.getenv("FEED_EXCLUDE", "").split(",") if u.strip()}
 
 def _parse_search_keyword():
@@ -397,6 +399,66 @@ def run_text_search(targets, keyword, target_label=""):
         print(f"❌ {len(failed_repos)} repo gagal dicari, keluar dengan error.")
         sys.exit(1)
 
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def _scan_single_repo(repo_info):
+    idx, total_targets, repo_url = repo_info
+    repo_name = "/".join(repo_url.rstrip("/").split("/")[-2:])
+    print(f"[{idx}/{total_targets}] 🚀 Scanning {repo_name} ({repo_url})...")
+    cmd = ["trufflehog", "git", repo_url, "--json", "--no-update"]
+    
+    findings = []
+    verified = []
+    
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=REPO_SCAN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(f"⏰ Timeout ({REPO_SCAN_TIMEOUT}s) terlampaui untuk {repo_name}! Melewati repo ini.")
+        return {
+            "repo": repo_name, "url": repo_url, "verified": 0, "total": 0,
+            "failed": True, "error": f"Timeout {REPO_SCAN_TIMEOUT}s",
+            "findings": [], "verified_findings": []
+        }
+    except OSError as e:
+        print(f"❌ Gagal menjalankan trufflehog untuk {repo_name}: {e}")
+        return {
+            "repo": repo_name, "url": repo_url, "verified": 0, "total": 0,
+            "failed": True, "error": str(e),
+            "findings": [], "verified_findings": []
+        }
+
+    if res.returncode not in (0, 1):
+        err = (res.stderr or "").strip()[-300:]
+        print(f"❌ Scan GAGAL untuk {repo_name} (exit {res.returncode}): {err}")
+        return {
+            "repo": repo_name, "url": repo_url, "verified": 0, "total": 0,
+            "failed": True, "error": err,
+            "findings": [], "verified_findings": []
+        }
+
+    repo_verified = 0
+    repo_total = 0
+    raw_lines = res.stdout.strip().split("\n") if res.stdout.strip() else []
+    for line in raw_lines:
+        try:
+            data = json.loads(line)
+            data["_scanned_repo"] = repo_name
+            if data.get("Verified", False):
+                repo_verified += 1
+                verified.append(data)
+            findings.append(data)
+            repo_total += 1
+        except Exception:
+            pass
+
+    print(f"✅ Selesai [{idx}/{total_targets}] {repo_name}: {repo_verified} aktif, {repo_total} total.")
+    return {
+        "repo": repo_name, "url": repo_url, "verified": repo_verified, "total": repo_total,
+        "failed": False, "error": None,
+        "findings": findings, "verified_findings": verified
+    }
+
 def main():
     feed_detail = []
 
@@ -445,47 +507,25 @@ def main():
     repo_summaries = []
     failed_repos = []
 
-    for idx, repo_url in enumerate(targets, 1):
-        repo_name = "/".join(repo_url.rstrip("/").split("/")[-2:])  # === [UBAH] === owner/repo biar jelas user mana
-        print(f"[{idx}/{total_targets}] Scanning {repo_name} ({repo_url})...")
-        cmd = ["trufflehog", "git", repo_url, "--json", "--no-update"]
-        try:
-            res = subprocess.run(cmd, capture_output=True, text=True)
-        except OSError as e:
-            print(f"❌ Gagal menjalankan trufflehog untuk {repo_name}: {e}")
-            failed_repos.append({"repo": repo_name, "url": repo_url, "error": f"trufflehog tidak bisa dijalankan: {e}"})
-            repo_summaries.append({"repo": repo_name, "url": repo_url, "verified": 0, "total": 0, "failed": True})
-            continue
-
-        if res.returncode not in (0, 1):  # === [UBAH] === trufflehog exit 1 = ketemu secret (bukan error)
-            err = (res.stderr or "").strip()[-300:]
-            print(f"❌ Scan GAGAL untuk {repo_name} (exit {res.returncode}): {err}")
-            failed_repos.append({"repo": repo_name, "url": repo_url, "error": err})
-            repo_summaries.append({"repo": repo_name, "url": repo_url, "verified": 0, "total": 0, "failed": True})
-            continue
-
-        repo_verified = 0
-        repo_total = 0
-        raw_lines = res.stdout.strip().split("\n") if res.stdout.strip() else []
-        for line in raw_lines:
-            try:
-                data = json.loads(line)
-                data["_scanned_repo"] = repo_name
-                is_verified = data.get("Verified", False)
-                if is_verified:
-                    repo_verified += 1
-                    verified_findings.append(data)
-                all_findings.append(data)
-                repo_total += 1
-            except Exception:
-                pass
-
-        repo_summaries.append({
-            "repo": repo_name,
-            "url": repo_url,
-            "verified": repo_verified,
-            "total": repo_total
-        })
+    tasks = [(i, total_targets, url) for i, url in enumerate(targets, 1)]
+    print(f"⚡ Menjalankan parallel scan ({CONCURRENCY_WORKERS} workers, timeout {REPO_SCAN_TIMEOUT}s/repo)...")
+    
+    with ThreadPoolExecutor(max_workers=CONCURRENCY_WORKERS) as executor:
+        future_map = {executor.submit(_scan_single_repo, t): t for t in tasks}
+        for future in as_completed(future_map):
+            res_item = future.result()
+            repo_summaries.append({
+                "repo": res_item["repo"],
+                "url": res_item["url"],
+                "verified": res_item["verified"],
+                "total": res_item["total"],
+                "failed": res_item["failed"]
+            })
+            if res_item["failed"]:
+                failed_repos.append({"repo": res_item["repo"], "url": res_item["url"], "error": res_item["error"]})
+            else:
+                all_findings.extend(res_item["findings"])
+                verified_findings.extend(res_item["verified_findings"])
 
     with open("findings.json", "w") as f:
         json.dump(all_findings, f, indent=2)
