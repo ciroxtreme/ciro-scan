@@ -6,4 +6,6 @@ Adaptive Security Scanner & Codebase Audit Pipeline powered by TruffleHog & GitH
 - Menggunakan engine resmi **TruffleHog v3** dengan fitur *Live Verification* untuk memvalidasi token yang masih aktif.
 - Hasil laporan ringkas dan file dokumen `findings_active.json` / `findings_potential.json` langsung dikirim otomatis ke chat Telegram Tuan Ciro (temuan dipisah: aktif, potensial, noise; file `findings_noise.json` hanya ada di artifact GitHub).
 - **Pencarian teks bebas (`-bebas`):** kirim `<url repo/akun> -bebas <kata>` ke bot (contoh: `https://github.com/ciroxtreme -bebas password`) untuk mencari kata apa saja di seluruh history commit, tanpa scan TruffleHog. Hasilnya `text_search_results.json`.
+- **Mode feed global (`feed`):** ketik `feed` ke bot (atau target `feed` di workflow_dispatch) — otomatis ambil user yang paling baru aktif dari event publik GitHub, scan sampai 50 repo mereka (maks 3 repo/user, timeout 300 detik/repo, 5 worker paralel). Jalan otomatis tiap 6 jam via cron. Urutan user = urutan kemunculan di feed (paling baru dulu).
+- **Endpoint `/scan`:** butuh `?key=` yang sama dengan secret `SCAN_KEY` di Cloudflare Worker (kalau secret belum diset, endpoint ditolak).
 - **Zero Token Leak:** Seluruh token bot Telegram dan Personal Access Token tersimpan di GitHub Secrets / Cloudflare Worker Secrets (tidak ada token hardcoded di repositori).

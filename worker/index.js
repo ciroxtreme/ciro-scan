@@ -7,6 +7,7 @@
  * - GH_OWNER           : Akun GitHub (ciroxtreme)
  * - GH_REPO            : Nama repo (ciro-scan)
  * - ALLOWED_CHAT_ID    : ID Telegram Tuan Ciro (1936436999)
+ * - SCAN_KEY           : Kunci rahasia buat endpoint /scan (?key=...) — wajib diset, kalau kosong /scan ditolak
  */
 
 export default {
@@ -19,6 +20,10 @@ export default {
     if (url.pathname === "/scan") {
       const targetUrl = url.searchParams.get("url");
       const keyword = url.searchParams.get("keyword") || "";
+      const key = url.searchParams.get("key") || "";
+      if (!env.SCAN_KEY || key !== env.SCAN_KEY) {
+        return new Response("Forbidden: /scan butuh ?key= yang sama dengan secret SCAN_KEY di Worker.", { status: 403 });
+      }
       if (!targetUrl) {
         return new Response("Missing 'url' parameter", { status: 400 });
       }
@@ -48,7 +53,13 @@ export default {
           // Format bebas: <url> [-bebas <kata kunci>] — contoh:
           //   https://github.com/ciroxtreme/cdtt
           //   https://github.com/ciroxtreme -bebas password
-          if (text.startsWith("http://") || text.startsWith("https://") || text.startsWith("git@")) {
+          if (text === "feed" || text === "@feed" || text === "auto" || text === "/feed") {
+            await sendTelegram(chatId, `🛰️ Memicu scan feed global (repo orang aktif terbaru)...`, env);
+            const res = await triggerGitHubScan("feed", env, "");
+            if (!res.ok) {
+              await sendTelegram(chatId, `❌ Gagal memicu GitHub runner: <code>${esc(res.error)}</code>`, env);
+            }
+          } else if (text.startsWith("http://") || text.startsWith("https://") || text.startsWith("git@")) {
             const parts = text.split(/\s+/);
             const targetUrl = parts[0];
             let keyword = "";
@@ -65,7 +76,7 @@ export default {
               await sendTelegram(chatId, `❌ Gagal memicu GitHub runner: <code>${esc(res.error)}</code>`, env);
             }
           } else if (text === "/start") {
-            await sendTelegram(chatId, `👋 Halo Tuan Ciro! 🐷\n\nKirimkan saja link repositori Git (contoh: <code>https://github.com/user/repo</code>) langsung ke chat ini.\n\nSaya akan otomatis memicu TruffleHog runner dan mengirimkan hasil audit bocoran token beserta file JSON-nya ke sini!\n\n🔍 Mau cari kata bebas? Tambah <code>-bebas &lt;kata&gt;</code>, contoh:\n<code>https://github.com/ciroxtreme -bebas password</code>`, env);
+            await sendTelegram(chatId, `👋 Halo Tuan Ciro! 🐷\n\nKirimkan saja link repositori Git (contoh: <code>https://github.com/user/repo</code>) langsung ke chat ini.\n\nSaya akan otomatis memicu TruffleHog runner dan mengirimkan hasil audit bocoran token beserta file JSON-nya ke sini!\n\n🔍 Mau cari kata bebas? Tambah <code>-bebas &lt;kata&gt;</code>, contoh:\n<code>https://github.com/ciroxtreme -bebas password</code>\n\n🛰️ Ketik <code>feed</code> buat scan feed global (50 repo orang aktif terbaru, otomatis).`, env);
           } else {
             await sendTelegram(chatId, `⚠️ Format salah. Kirimkan link URL Git yang valid (diawali https://github.com/...).`, env);
           }

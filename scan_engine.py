@@ -24,7 +24,7 @@ FEED_EVENT_PAGES = int(os.getenv("FEED_EVENT_PAGES", "2"))        # halaman even
 FEED_MAX_USERS = int(os.getenv("FEED_MAX_USERS", "5"))            # maksimal berapa user yang dipicked
 FEED_MAX_REPOS_PER_USER = int(os.getenv("FEED_MAX_REPOS_PER_USER", "3"))  # maks repo per user
 FEED_MAX_TOTAL_REPOS = int(os.getenv("FEED_MAX_TOTAL_REPOS", "50"))        # total plafon repo per run (naik ke 50)
-REPO_SCAN_TIMEOUT = int(os.getenv("REPO_SCAN_TIMEOUT", "120"))               # timeout maks 2 menit (120 detik) per repo
+REPO_SCAN_TIMEOUT = int(os.getenv("REPO_SCAN_TIMEOUT", "300"))               # timeout maks 5 menit (300 detik) per repo — repo gede butuh waktu clone+scan
 CONCURRENCY_WORKERS = int(os.getenv("CONCURRENCY_WORKERS", "4"))             # parallel multi-worker TruffleHog
 FEED_EXCLUDE = {u.strip().lower() for u in os.getenv("FEED_EXCLUDE", "").split(",") if u.strip()}
 
@@ -183,15 +183,19 @@ def collect_targets_from_feed():
         print("❌ Feed kosong — tidak ada user yang bisa dipicked.")
         return [], []
 
-    picked_users = sorted(users_seen.keys())[:FEED_MAX_USERS]
+    # JANGAN di-sorted: urutan dict = urutan pertama ketemu di feed (event terbaru dulu)
+    picked_users = list(users_seen.keys())[:FEED_MAX_USERS]
     print(f"🎯 {len(users_seen)} user aktif terdeteksi, dipicked {len(picked_users)} user: "
           f"{', '.join(picked_users)}")
 
     targets, feed_detail = [], []
+    detail_by_user = {}
     # Strategi 1: repo yang BARU di-push/diubah user tsb (paling fresh, bocoran paling mungkin)
     for u in picked_users:
         targets.append(f"https://github.com/{users_seen[u]}")
-        feed_detail.append({"user": u, "repos": [users_seen[u]], "source": "feed (baru aktif)"})
+        entry = {"user": u, "repos": [users_seen[u]], "source": "feed (baru aktif)"}
+        feed_detail.append(entry)
+        detail_by_user[u] = entry
 
     # Strategi 2 (opsional): repo lain milik user, diurutkan dari yang terakhir di-push
     if FEED_MAX_REPOS_PER_USER > 1:
@@ -210,6 +214,7 @@ def collect_targets_from_feed():
                 url = r.get("html_url")
                 if url and url not in targets:
                     targets.append(url)
+                    detail_by_user[u]["repos"].append(url)
                     added += 1
 
     # dedup + plafon akhir
@@ -244,13 +249,21 @@ def resolve_target_repos(target_str):
         if GH_PAT:
             headers["Authorization"] = f"token {GH_PAT}"
 
+        urls = []
         try:
-            req = urllib.request.Request(api_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                repos_data = json.loads(resp.read().decode())
-                urls = [r["html_url"] for r in repos_data if not r.get("fork")]
-                print(f"✅ Ditemukan {len(urls)} repositori publik untuk akun '{owner}'")
-                return urls
+            page = 1
+            while True:
+                req = urllib.request.Request(f"{api_url}&page={page}", headers=headers)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    repos_data = json.loads(resp.read().decode())
+                if not repos_data:
+                    break
+                urls.extend(r["html_url"] for r in repos_data if not r.get("fork"))
+                if len(repos_data) < 100:
+                    break
+                page += 1
+            print(f"✅ Ditemukan {len(urls)} repositori publik untuk akun '{owner}'")
+            return urls
         except Exception as e:
             print(f"⚠️ Gagal mengambil daftar repo akun {owner}: {e}")
             return [clean]
@@ -416,14 +429,14 @@ def _scan_single_repo(repo_info):
     except subprocess.TimeoutExpired:
         print(f"⏰ Timeout ({REPO_SCAN_TIMEOUT}s) terlampaui untuk {repo_name}! Melewati repo ini.")
         return {
-            "repo": repo_name, "url": repo_url, "verified": 0, "total": 0,
+            "repo": repo_name, "url": repo_url, "idx": idx, "verified": 0, "total": 0,
             "failed": True, "error": f"Timeout {REPO_SCAN_TIMEOUT}s",
             "findings": [], "verified_findings": []
         }
     except OSError as e:
         print(f"❌ Gagal menjalankan trufflehog untuk {repo_name}: {e}")
         return {
-            "repo": repo_name, "url": repo_url, "verified": 0, "total": 0,
+            "repo": repo_name, "url": repo_url, "idx": idx, "verified": 0, "total": 0,
             "failed": True, "error": str(e),
             "findings": [], "verified_findings": []
         }
@@ -432,7 +445,7 @@ def _scan_single_repo(repo_info):
         err = (res.stderr or "").strip()[-300:]
         print(f"❌ Scan GAGAL untuk {repo_name} (exit {res.returncode}): {err}")
         return {
-            "repo": repo_name, "url": repo_url, "verified": 0, "total": 0,
+            "repo": repo_name, "url": repo_url, "idx": idx, "verified": 0, "total": 0,
             "failed": True, "error": err,
             "findings": [], "verified_findings": []
         }
@@ -454,7 +467,7 @@ def _scan_single_repo(repo_info):
 
     print(f"✅ Selesai [{idx}/{total_targets}] {repo_name}: {repo_verified} aktif, {repo_total} total.")
     return {
-        "repo": repo_name, "url": repo_url, "verified": repo_verified, "total": repo_total,
+        "repo": repo_name, "url": repo_url, "idx": idx, "verified": repo_verified, "total": repo_total,
         "failed": False, "error": None,
         "findings": findings, "verified_findings": verified
     }
@@ -517,19 +530,22 @@ def main():
             repo_summaries.append({
                 "repo": res_item["repo"],
                 "url": res_item["url"],
+                "idx": res_item["idx"],
                 "verified": res_item["verified"],
                 "total": res_item["total"],
                 "failed": res_item["failed"]
             })
             if res_item["failed"]:
-                failed_repos.append({"repo": res_item["repo"], "url": res_item["url"], "error": res_item["error"]})
+                failed_repos.append({"repo": res_item["repo"], "url": res_item["url"], "idx": res_item["idx"], "error": res_item["error"]})
             else:
                 all_findings.extend(res_item["findings"])
                 verified_findings.extend(res_item["verified_findings"])
 
-    with open("findings.json", "w") as f:
-        json.dump(all_findings, f, indent=2)
+    # Urutan laporan = urutan target (as_completed acak, jadi diurutkan lagi)
+    repo_summaries.sort(key=lambda s: s.get("idx", 0))
+    failed_repos.sort(key=lambda s: s.get("idx", 0))
 
+    # findings.json mentah (berisi kunci asli) TIDAK ditulis lagi — cukup file split yang aman
     buckets = {"active": [], "potential": [], "noise": []}
     seen_split = set()
     for data in all_findings:
