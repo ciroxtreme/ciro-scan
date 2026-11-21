@@ -17,7 +17,7 @@ on:
 jobs:
   trufflehog-scan:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - name: Checkout Repo Scanner
         uses: actions/checkout@v4
@@ -44,10 +44,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_PAT: ${{ secrets.GH_PAT }}
-          FEED_EVENT_PAGES: "3"
-          FEED_MAX_USERS: "8"
-          FEED_MAX_REPOS_PER_USER: "2"
-          FEED_MAX_TOTAL_REPOS: "12"
+          FEED_EVENT_PAGES: "5"
+          FEED_MAX_USERS: "25"
+          FEED_MAX_REPOS_PER_USER: "3"
+          FEED_MAX_TOTAL_REPOS: "50"
+          REPO_SCAN_TIMEOUT: "120"
+          CONCURRENCY_WORKERS: "5"
         run: |
           python -u scan_engine.py "$TARGET_URL"
 
