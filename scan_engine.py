@@ -175,7 +175,8 @@ def _gh_code_search(query, retries=None, page=None):
         "Accept": "application/vnd.github.text-match+json",
     }
     
-    target_page = page if page is not None else random.randint(1, 3)
+    # Acak halaman 1 sampai 5 agar hasil search bervariasi dan menyapu repo baru tiap run
+    target_page = page if page is not None else random.randint(1, 5)
     params = {"q": query, "per_page": 100, "page": target_page}
     for attempt in range(retries + 1):
         tok = get_next_gh_token()
@@ -1031,6 +1032,22 @@ def _mode_collect_only():
     with open("targets.json", "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     print(f"📁 targets.json: {total_targets} repo target (mode {mode_tag})")
+
+    # Persistensikan target yang baru dikumpulkan ke branch 'state' agar scan berikutnya 100% repo baru
+    if mode_tag in ("dork", "feed") and targets:
+        try:
+            new_repos = set()
+            new_users = set()
+            for t in targets:
+                clean_t = t.rstrip("/").split("/")
+                if len(clean_t) >= 2:
+                    repo_full = f"{clean_t[-2]}/{clean_t[-1]}"
+                    new_repos.add(repo_full)
+                    new_users.add(clean_t[-2])
+            print(f"💾 Menyimpan {len(new_repos)} repo & {len(new_users)} user baru ke cache riwayat (branch '{CACHE_BRANCH}')...")
+            _save_scanned_history(new_repos, new_users)
+        except Exception as e:
+            print(f"⚠️ Gagal auto-update cache saat collect: {e}")
 
 def _mode_shard_scan():
     """Job scan matrix: scan hanya shard ke-SHARD_INDEX (round-robin), tulis file shard."""
