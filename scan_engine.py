@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import re
+import time
 import shutil
 import subprocess
 import tempfile
@@ -12,9 +13,22 @@ import requests
 
 TARGET_INPUT = sys.argv[1] if len(sys.argv) > 1 else os.getenv("TARGET_URL", "")
 
+# === [BARU] === Mode feed: aktif kalau target = "feed", argumen --feed, atau env FEED_MODE
+FEED_MODE = (
+    TARGET_INPUT.strip().lower() in ("feed", "auto", "@feed")
+    or "--feed" in sys.argv
+    or os.getenv("FEED_MODE", "").strip().lower() in ("1", "true", "yes")
+)
+# === [BARU] === Konfigurasi feed (semua via env supaya bisa diatur di workflow)
+FEED_EVENT_PAGES = int(os.getenv("FEED_EVENT_PAGES", "2"))        # halaman event disedot (100 event/halaman)
+FEED_MAX_USERS = int(os.getenv("FEED_MAX_USERS", "5"))            # maksimal berapa user yang dipicked
+FEED_MAX_REPOS_PER_USER = int(os.getenv("FEED_MAX_REPOS_PER_USER", "3"))  # maks repo per user
+FEED_MAX_TOTAL_REPOS = int(os.getenv("FEED_MAX_TOTAL_REPOS", "15"))        # total plafon repo per run
+FEED_EXCLUDE = {u.strip().lower() for u in os.getenv("FEED_EXCLUDE", "").split(",") if u.strip()}
+
 def _parse_search_keyword():
     """Ambil kata kunci pencarian teks bebas dari CLI (--search / -bebas) atau env."""
-    args = sys.argv[2:]
+    args = [a for a in sys.argv[2:] if a != "--feed"]  # === [UBAH] === filter flag --feed
     for i, a in enumerate(args):
         if a in ("--search", "-bebas") and i + 1 < len(args):
             return args[i + 1].strip()
@@ -28,6 +42,30 @@ SEARCH_KEYWORD = _parse_search_keyword()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1936436999")
 GH_PAT = os.getenv("GH_PAT", "")
+
+# === [BARU] === Helper API GitHub dengan rate-limit handling (dipakai mode feed)
+def _gh_api_get(url, retries=2):
+    headers = {"User-Agent": "CiroScan-BatchEngine", "Accept": "application/vnd.github+json"}
+    if GH_PAT:
+        headers["Authorization"] = f"Bearer {GH_PAT}"
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            if resp.status_code in (403, 429) and attempt < retries:
+                reset = int(resp.headers.get("X-RateLimit-Reset", "0") or 0)
+                wait = min(max(reset - time.time() + 2, 5), 180)
+                print(f"⏳ Rate limit kena, jeda {int(wait)}s lalu retry...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(3)
+                continue
+            print(f"⚠️ API gagal ({url}): {e}")
+            return None
+    return None
 
 def send_telegram_text(text):
     if not TELEGRAM_BOT_TOKEN:
@@ -111,6 +149,79 @@ def safe_record(data, bucket, reason):
         "redacted": (data.get("Redacted") or "").replace("\n", " ")[:90],
     }
 
+# === [BARU] ================================================================
+# MODE FEED GLOBAL: sedot user + repo yang baru saja aktif di GitHub publik,
+# lalu jadikan target batch scan otomatis.
+# ===========================================================================
+def collect_targets_from_feed():
+    users_seen = {}   # login -> repo pertama yang ia sentuh (paling fresh)
+
+    print(f"📡 FEED GLOBAL: menyedot {FEED_EVENT_PAGES} halaman event publik GitHub...")
+    for page in range(1, FEED_EVENT_PAGES + 1):
+        events = _gh_api_get(f"https://api.github.com/events?per_page=100&page={page}")
+        if not events:
+            print(f"⚠️ Halaman {page}: tidak ada data event / gagal fetch.")
+            break
+        for ev in events:
+            # hanya event yang menandakan aktivitas kode (bukan watch/fork doang)
+            if ev.get("type") not in ("PushEvent", "PullRequestEvent", "IssuesEvent",
+                                       "IssueCommentEvent", "CreateEvent", "ReleaseEvent"):
+                continue
+            actor = (ev.get("actor") or {}).get("login")
+            repo = (ev.get("repo") or {}).get("name")
+            if not actor or not repo:
+                continue
+            if "[bot]" in actor.lower() or actor.lower() in FEED_EXCLUDE:
+                continue
+            if actor not in users_seen:
+                users_seen[actor] = repo
+        time.sleep(1)  # santai sedikit biar tidak dibatasi
+
+    if not users_seen:
+        print("❌ Feed kosong — tidak ada user yang bisa dipicked.")
+        return [], []
+
+    picked_users = sorted(users_seen.keys())[:FEED_MAX_USERS]
+    print(f"🎯 {len(users_seen)} user aktif terdeteksi, dipicked {len(picked_users)} user: "
+          f"{', '.join(picked_users)}")
+
+    targets, feed_detail = [], []
+    # Strategi 1: repo yang BARU di-push/diubah user tsb (paling fresh, bocoran paling mungkin)
+    for u in picked_users:
+        targets.append(f"https://github.com/{users_seen[u]}")
+        feed_detail.append({"user": u, "repos": [users_seen[u]], "source": "feed (baru aktif)"})
+
+    # Strategi 2 (opsional): repo lain milik user, diurutkan dari yang terakhir di-push
+    if FEED_MAX_REPOS_PER_USER > 1:
+        for u in picked_users:
+            if len(targets) >= FEED_MAX_TOTAL_REPOS:
+                break
+            repos = _gh_api_get(f"https://api.github.com/users/{u}/repos?per_page=100&sort=pushed&type=owner")
+            if not repos:
+                continue
+            added = 0
+            for r in repos:
+                if added >= FEED_MAX_REPOS_PER_USER - 1 or len(targets) >= FEED_MAX_TOTAL_REPOS:
+                    break
+                if r.get("fork") or r.get("private") or r.get("size", 0) == 0:
+                    continue
+                url = r.get("html_url")
+                if url and url not in targets:
+                    targets.append(url)
+                    added += 1
+
+    # dedup + plafon akhir
+    seen, final = set(), []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            final.append(t)
+    final = final[:FEED_MAX_TOTAL_REPOS]
+
+    print(f"✅ Total {len(final)} repo target dari feed: {', '.join(t.split('/')[-1] for t in final)}")
+    return final, feed_detail
+# === [SELESAI BARU] =======================================================
+
 def resolve_target_repos(target_str):
     """
     Mendeteksi apakah target berupa:
@@ -118,12 +229,10 @@ def resolve_target_repos(target_str):
     2. Akun/Organisasi (misal: https://github.com/ciroxtreme atau ciroxtreme)
     """
     clean = target_str.strip().rstrip("/")
-    # Pola: https://github.com/owner/repo
     m_repo = re.match(r"^https?://github\.com/([^/]+)/([^/]+)/?$", clean)
     if m_repo:
         return [f"https://github.com/{m_repo.group(1)}/{m_repo.group(2)}"]
 
-    # Pola akun: https://github.com/owner atau @owner atau owner
     m_user = re.match(r"^(?:https?://github\.com/)?@?([^/]+)/?$", clean)
     if m_user:
         owner = m_user.group(1)
@@ -132,7 +241,7 @@ def resolve_target_repos(target_str):
         headers = {"User-Agent": "CiroScan-BatchEngine"}
         if GH_PAT:
             headers["Authorization"] = f"token {GH_PAT}"
-        
+
         try:
             req = urllib.request.Request(api_url, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as resp:
@@ -142,9 +251,8 @@ def resolve_target_repos(target_str):
                 return urls
         except Exception as e:
             print(f"⚠️ Gagal mengambil daftar repo akun {owner}: {e}")
-            # Fallback jika ternyata target repo non-standard
             return [clean]
-    
+
     return [clean]
 
 # --- Pencarian teks bebas (-bebas): cari kata apa saja di seluruh history git ---
@@ -169,7 +277,6 @@ def search_text_in_repo(repo_url, keyword, repo_name):
         if clone.returncode != 0:
             err = (clone.stderr or "").strip()[-300:]
             return [], f"git clone gagal: {err}"
-        # 1) Commit mana saja yang diff-nya menyentuh keyword (case-insensitive, literal)
         pattern = re.escape(keyword)
         log = subprocess.run(
             ["git", "-C", tmpdir, "log", "--all", "--pretty=format:%H", "-i", "-G", pattern],
@@ -216,20 +323,20 @@ def search_text_in_repo(repo_url, keyword, repo_name):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-def run_text_search(targets, keyword):
+def run_text_search(targets, keyword, target_label=""):
     """Mode -bebas: cari keyword di semua repo target, laporkan ke Telegram."""
     total_targets = len(targets)
     is_batch = total_targets > 1
     send_telegram_text(
         f"🔍 <b>PENCARIAN TEKS BEBAS DIMULAI!</b>\n\n🔎 <b>Kata kunci:</b> <code>{html.escape(keyword)}</code>\n"
-        f"🎯 <b>Target:</b> <code>{TARGET_INPUT}</code>\n📦 <b>Total Repositori:</b> <b>{total_targets} repo</b>\n"
+        f"🎯 <b>Target:</b> <code>{target_label or TARGET_INPUT}</code>\n📦 <b>Total Repositori:</b> <b>{total_targets} repo</b>\n"
         f"⏳ <i>Sedang menyisir seluruh history commit...</i>")
 
     all_matches = []
     failed_repos = []
     repo_summaries = []
     for idx, repo_url in enumerate(targets, 1):
-        repo_name = repo_url.split("/")[-1]
+        repo_name = "/".join(repo_url.rstrip("/").split("/")[-2:])  # === [UBAH] === nama repo full owner/repo biar tidak ambigu saat banyak user
         print(f"[{idx}/{total_targets}] Searching '{keyword}' in {repo_name} ({repo_url})...")
         matches, err = search_text_in_repo(repo_url, keyword, repo_name)
         if err:
@@ -254,7 +361,7 @@ def run_text_search(targets, keyword):
         "🔍 <b>HASIL PENCARIAN TEKS BEBAS</b>",
         "━━━━━━━━━━━━━━━━━━",
         f"🔎 <b>Kata kunci:</b> <code>{html.escape(keyword)}</code>",
-        f"🎯 <b>Target:</b> <code>{TARGET_INPUT}</code>",
+        f"🎯 <b>Target:</b> <code>{target_label or TARGET_INPUT}</code>",
         f"📦 <b>Repo Dicari:</b> <b>{total_targets} repositori</b>",
         f"✅ <b>Kecocokan di kode sendiri:</b> <b>{len(potential)}</b>",
         f"🗑️ <b>Kecocokan di vendor/noise:</b> {len(noise)}",
@@ -285,32 +392,51 @@ def run_text_search(targets, keyword):
 
     if all_matches:
         send_telegram_document("text_search_results.json",
-                               f"🔍 Hasil pencarian '{keyword}' ({len(all_matches)} kecocokan) — {TARGET_INPUT}")
+                               f"🔍 Hasil pencarian '{keyword}' ({len(all_matches)} kecocokan) — {target_label or TARGET_INPUT}")
     if failed_repos:
         print(f"❌ {len(failed_repos)} repo gagal dicari, keluar dengan error.")
         sys.exit(1)
 
 def main():
-    if not TARGET_INPUT:
-        print("❌ Error: No target input provided.")
-        sys.exit(1)
+    feed_detail = []
 
-    targets = resolve_target_repos(TARGET_INPUT)
+    # === [UBAH] === Cabang mode feed global — target otomatis dari event publik GitHub
+    if FEED_MODE:
+        print("🛰️ MODE FEED GLOBAL aktif — target ditentukan otomatis.")
+        targets, feed_detail = collect_targets_from_feed()
+        if not targets:
+            send_telegram_text("⚠️ <b>Mode Feed gagal</b> — tidak ada user/repo yang bisa diambil dari event publik. Cek log runner / rate limit (pakai GH_PAT!).")
+            sys.exit(1)
+        target_label = f"FEED GLOBAL · {len(feed_detail)} user aktif"
+    else:
+        if not TARGET_INPUT:
+            print("❌ Error: No target input provided. (atau pakai target 'feed' / env FEED_MODE=1)")
+            sys.exit(1)
+        targets = resolve_target_repos(TARGET_INPUT)
+        target_label = TARGET_INPUT
 
-    # Mode pencarian teks bebas: -bebas <keyword> (ganti TruffleHog untuk run ini)
+    # Mode pencarian teks bebas: -bebas <keyword>
     if SEARCH_KEYWORD:
-        run_text_search(targets, SEARCH_KEYWORD)
+        run_text_search(targets, SEARCH_KEYWORD, target_label)
         return
 
     total_targets = len(targets)
 
     if total_targets == 0:
-        send_telegram_text(f"⚠️ Tidak ditemukan repositori untuk target: <code>{TARGET_INPUT}</code>")
+        send_telegram_text(f"⚠️ Tidak ditemukan repositori untuk target: <code>{target_label}</code>")
         return
 
     is_batch = total_targets > 1
-    if is_batch:
-        send_telegram_text(f"🚀 <b>TRUFFLEHOG BATCH SCAN DIMULAI!</b>\n\n👤 <b>Target Akun:</b> <code>{TARGET_INPUT}</code>\n📦 <b>Total Repositori:</b> <b>{total_targets} repo</b>\n⏳ <i>Runner sedang menyisir seluruh repositori satu per satu...</i>")
+    if FEED_MODE and is_batch:
+        user_list = ", ".join(f"@{d['user']}" for d in feed_detail[:10])
+        send_telegram_text(
+            f"🛰️ <b>FEED-HUNT SCAN DIMULAI!</b>\n\n"
+            f"📡 <b>Target:</b> Auto dari feed global GitHub\n"
+            f"👤 <b>User terpilih:</b> {user_list}\n"
+            f"📦 <b>Total Repositori:</b> <b>{total_targets} repo</b>\n"
+            f"⏳ <i>Runner menyedot repo hasil aktivitas paling baru...</i>")
+    elif is_batch:
+        send_telegram_text(f"🚀 <b>TRUFFLEHOG BATCH SCAN DIMULAI!</b>\n\n👤 <b>Target Akun:</b> <code>{target_label}</code>\n📦 <b>Total Repositori:</b> <b>{total_targets} repo</b>\n⏳ <i>Runner sedang menyisir seluruh repositori satu per satu...</i>")
     else:
         send_telegram_text(f"🔍 <b>TruffleHog Security Scan Dimulai!</b>\n\n🎯 <b>Target:</b> <code>{targets[0]}</code>\n⏳ <i>Sedang mengendus seluruh riwayat commit...</i>")
 
@@ -320,7 +446,7 @@ def main():
     failed_repos = []
 
     for idx, repo_url in enumerate(targets, 1):
-        repo_name = repo_url.split("/")[-1]
+        repo_name = "/".join(repo_url.rstrip("/").split("/")[-2:])  # === [UBAH] === owner/repo biar jelas user mana
         print(f"[{idx}/{total_targets}] Scanning {repo_name} ({repo_url})...")
         cmd = ["trufflehog", "git", repo_url, "--json", "--no-update"]
         try:
@@ -331,7 +457,7 @@ def main():
             repo_summaries.append({"repo": repo_name, "url": repo_url, "verified": 0, "total": 0, "failed": True})
             continue
 
-        if res.returncode != 0:
+        if res.returncode not in (0, 1):  # === [UBAH] === trufflehog exit 1 = ketemu secret (bukan error)
             err = (res.stderr or "").strip()[-300:]
             print(f"❌ Scan GAGAL untuk {repo_name} (exit {res.returncode}): {err}")
             failed_repos.append({"repo": repo_name, "url": repo_url, "error": err})
@@ -353,7 +479,7 @@ def main():
                 repo_total += 1
             except Exception:
                 pass
-        
+
         repo_summaries.append({
             "repo": repo_name,
             "url": repo_url,
@@ -361,11 +487,9 @@ def main():
             "total": repo_total
         })
 
-    # Simpan laporan json (mentah, hanya di runner — TIDAK dikirim/upload)
     with open("findings.json", "w") as f:
         json.dump(all_findings, f, indent=2)
 
-    # Pisah jadi 3 file AMAN (tanpa nilai kunci asli)
     buckets = {"active": [], "potential": [], "noise": []}
     seen_split = set()
     for data in all_findings:
@@ -389,11 +513,10 @@ def main():
     total_potential = len(buckets["potential"])
     total_noise = len(buckets["noise"])
 
-    # Susun Pesan Ringkasan
     msg_lines = [
         "📊 <b>LAPORAN HASIL AUDIT TRUFFLEHOG</b>",
         "━━━━━━━━━━━━━━━━━━",
-        f"🎯 <b>Target:</b> <code>{TARGET_INPUT}</code>",
+        f"🎯 <b>Target:</b> <code>{'FEED GLOBAL (auto)' if FEED_MODE else target_label}</code>",
         f"📦 <b>Repo Discan:</b> <b>{total_targets} repositori</b>",
         f"🚨 <b>Aktif (verified):</b> <b>{total_active}</b>",
         f"⚠️ <b>Potensial:</b> {total_potential}",
@@ -410,6 +533,9 @@ def main():
             else:
                 icon = "❌" if s["verified"] > 0 else "✅"
                 msg_lines.append(f"{icon} <code>{s['repo']}</code> : <b>{s['verified']} aktif bocor</b> ({s['total']} potensi)")
+        if FEED_MODE and feed_detail:
+            msg_lines.append(f"\n🛰️ <i>Target picked otomatis dari feed: "
+                             f"{', '.join('@'+d['user'] for d in feed_detail[:10])}</i>")
 
     if total_active > 0:
         msg_lines.append("\n🔥 <b>DETAIL TOKEN AKTIF BOCOR:</b>")
@@ -420,19 +546,17 @@ def main():
     elif failed_repos:
         msg_lines.append("\n⚠️ <b>STATUS: SCAN TIDAK LENGKAP!</b> Ada repo yang gagal discan — hasil di atas belum bisa dipercaya sebagai \"aman\".")
         for fr in failed_repos:
-            msg_lines.append(f"• <code>{fr['repo']}</code>: <code>{fr['error'][:200]}</code>")
+            msg_lines.append(f"• <code>{fr['repo']}</code>: <code>{html.escape(fr['error'][:200])}</code>")
     else:
         msg_lines.append("\n🏆 <b>STATUS: 100% AMAN!</b> Tidak ada kunci rahasia aktif yang bocor!")
 
     report_text = "\n".join(msg_lines)
     send_telegram_text(report_text)
 
-    # Kirim file JSON pisah (AMAN, tanpa nilai kunci asli) — aktif & potensial saja;
-    # noise hanya jadi artifact GitHub supaya tidak nge-spam Telegram
     if total_active > 0:
-        send_telegram_document("findings_active.json", f"🚨 File JSON Temuan AKTIF ({total_active}) — {TARGET_INPUT}")
+        send_telegram_document("findings_active.json", f"🚨 File JSON Temuan AKTIF ({total_active}) — {'FEED GLOBAL' if FEED_MODE else target_label}")
     if total_potential > 0:
-        send_telegram_document("findings_potential.json", f"⚠️ File JSON Temuan POTENSIAL ({total_potential}) — {TARGET_INPUT}")
+        send_telegram_document("findings_potential.json", f"⚠️ File JSON Temuan POTENSIAL ({total_potential}) — {'FEED GLOBAL' if FEED_MODE else target_label}")
 
     if failed_repos:
         print(f"❌ {len(failed_repos)} repo gagal discan, keluar dengan error.")
