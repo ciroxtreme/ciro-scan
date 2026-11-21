@@ -2,7 +2,7 @@ name: Fast AI Token Dredger
 
 on:
   schedule:
-    - cron: "0 */2 * * *"  # Otomatis sedot tiap 2 jam sekali
+    - cron: "*/15 * * * *"  # Otomatis sedot tiap 2 jam sekali
   workflow_dispatch:
 
 jobs:
