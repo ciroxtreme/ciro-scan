@@ -11,6 +11,7 @@ import html
 import urllib.request
 import urllib.parse
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TARGET_INPUT = sys.argv[1] if len(sys.argv) > 1 else os.getenv("TARGET_URL", "")
 
@@ -42,6 +43,7 @@ DORK_QUERIES_RAW = os.getenv("DORK_QUERIES", "").strip()
 DORK_QUERIES_PER_RUN = int(os.getenv("DORK_QUERIES_PER_RUN", "3"))   # query dijalankan per run (rate limit code search = 10/menit)
 DORK_MAX_REPOS = int(os.getenv("DORK_MAX_REPOS", "15"))              # plafon repo target per run
 DORK_MAX_REPO_SIZE_KB = int(os.getenv("DORK_MAX_REPO_SIZE_KB", "200000"))  # skip repo raksasa (clone lama)
+DORK_QUERY_WORKERS = int(os.getenv("DORK_QUERY_WORKERS", "4"))              # query dork jalan paralel (maks 4 bersamaan)
 # Query default kalau env tidak diisi — set aman & terbukti produktif
 DORK_DEFAULT_QUERIES = [
     # 1. Kunci SSH privat — hampir selalu asli kalau ke-commit
@@ -206,8 +208,17 @@ def collect_targets_from_dork():
     seen = set()
     dork_detail = []
 
+    # ASINKRON: semua query jalan PARALEL (query independen; rate limit
+    # code search 30/menit, 3 query bersamaan masih jauh di bawah batas).
+    # Hasil digabung SESUAI URUTAN query (bukan urutan selesai) biar stabil.
+    results_by_query = {}
+    with ThreadPoolExecutor(max_workers=min(n, DORK_QUERY_WORKERS)) as ex:
+        fut2q = {ex.submit(_gh_code_search, q): q for q in picked_queries}
+        for fut in as_completed(fut2q):
+            results_by_query[fut2q[fut]] = fut.result()
+
     for qi, query in enumerate(picked_queries, 1):
-        items = _gh_code_search(query)
+        items = results_by_query.get(query)
         if items is None:
             dork_detail.append({"query": query, "found": 0, "error": True})
             continue
@@ -228,8 +239,6 @@ def collect_targets_from_dork():
         if len(repo_urls) >= DORK_MAX_REPOS:
             print(f"   🛑 Plafon {DORK_MAX_REPOS} repo tercapai.")
             break
-        if qi < n:
-            time.sleep(7)  # jaga rate limit 10 query/menit
 
     repo_urls = repo_urls[:DORK_MAX_REPOS]
     if repo_urls:
@@ -577,8 +586,6 @@ def run_text_search(targets, keyword, target_label=""):
         print(f"❌ {len(failed_repos)} repo gagal dicari, keluar dengan error.")
         sys.exit(1)
 
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def _scan_single_repo(repo_info):
     idx, total_targets, repo_url = repo_info
