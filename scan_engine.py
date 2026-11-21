@@ -54,31 +54,46 @@ DORK_MAX_REPO_SIZE_KB = int(os.getenv("DORK_MAX_REPO_SIZE_KB", "200000"))  # ski
 DORK_QUERY_WORKERS = int(os.getenv("DORK_QUERY_WORKERS", "4"))              # query dork jalan paralel (maks 4 bersamaan)
 # Query default kalau env tidak diisi — set aman & terbukti produktif
 DORK_DEFAULT_QUERIES = [
-    # === 1. SULTAN AZURE OPENAI ENTERPRISE (Cluster K8s & Infra Prod) ===
-    "filename:values.yaml azureOpenAIApiKey",
-    "filename:helm AZURE_OPENAI_KEY",
-    "filename:.env AZURE_OPENAI_API_KEY openai.azure.com",
-    "filename:docker-compose.yml AZURE_OPENAI_API_KEY",
+    # === 1. CLAUDE CODE & ANTHROPIC OAUTH (Update Maret-Juni 2026) ===
+    # Prefix baru 2026: sk-ant-oat01- (OAuth Claude Code) & sk-ant-api03-
+    "path:*.json mcpServers ANTHROPIC_API_KEY",
+    "path:.cursor/mcp.json ANTHROPIC_API_KEY",
+    "path:.claude.json api_key",
+    "sk-ant-oat01- path:*.env",
+    "sk-ant-api03- path:*.env -example -test",
 
-    # === 2. SULTAN AWS BEDROCK (Akun Enterprise / AWS Org) ===
-    "filename:.env AWS_BEDROCK_API_KEY",
-    "filename:.env BEDROCK_ASSUME_ROLE_ARN",
-    "filename:terraform.tfvars aws_bedrock",
+    # === 2. MCP (MODEL CONTEXT PROTOCOL) & CURSOR LEAKS (Tren Baru 2026) ===
+    # 24,000+ API key bocor di file konfigurasi MCP tool Cursor & Windsurf
+    "path:*.json mcpServers OPENAI_API_KEY",
+    "path:mcp.json api_key",
+    "path:.cursor/mcp.json apiKey",
+    "path:*.json mcpServers GROQ_API_KEY",
 
-    # === 3. SULTAN ANTHROPIC CLAUDE PRODUCTION (Organisasi Berbayar) ===
-    "filename:docker-compose.yml ANTHROPIC_API_KEY sk-ant",
-    "filename:values.yaml ANTHROPIC_API_KEY",
-    "filename:.env.production ANTHROPIC_API_KEY sk-ant",
+    # === 3. SULTAN ENTERPRISE KUBERNETES & CLOUD CLUSTER ===
+    "path:*.yaml azureOpenAIApiKey",
+    "path:values.yaml AZURE_OPENAI_API_KEY",
+    "path:docker-compose.yml AZURE_OPENAI_API_KEY",
+    "path:*.env BEDROCK_ASSUME_ROLE_ARN",
 
-    # === 4. SULTAN OPENAI ENTERPRISE / TIER 5 (Organisasi Skala Besar) ===
-    "filename:docker-compose.yml OPENAI_API_KEY sk-proj-",
-    "filename:.env.production OPENAI_API_KEY sk-proj-",
-    "filename:kustomization.yaml OPENAI_API_KEY",
+    # === 4. OPENAI TIER 5 & PROJECT KEYS ===
+    # Prefix resmi modern: sk-proj-
+    "sk-proj- path:*.env -your_key -example -placeholder",
+    "path:docker-compose.yml OPENAI_API_KEY sk-proj-",
 
-    # === 5. SULTAN LLM INFRASTRUCTURE (Perplexity Pro, Cohere Enterprise, Groq Tier 3) ===
-    "filename:.env.production PERPLEXITY_API_KEY pplx-",
-    "filename:docker-compose.yml COHERE_API_KEY",
-    "filename:.env.production GROQ_API_KEY gsk_",
+    # === 5. VOICE AI SULTAN (ElevenLabs, Deepgram) ===
+    "path:*.env ELEVENLABS_API_KEY",
+    "xi-api-key path:*.py",
+    "path:*.env DEEPGRAM_API_KEY",
+
+    # === 6. GOOGLE GEMINI 1.5/2.0 GENERATIVE LANGUAGE ===
+    "AIzaSy path:*.env generativelanguage",
+    "AIzaSy path:*.env gemini -example",
+
+    # === 7. FAST INFERENCE & HIGH-END LLM (DeepSeek, Groq, Perplexity, OpenRouter) ===
+    "path:*.env DEEPSEEK_API_KEY sk-",
+    "path:*.env PERPLEXITY_API_KEY pplx-",
+    "gsk_ path:*.env -example",
+    "path:*.env OPENROUTER_API_KEY sk-or-",
 ]
 
 
