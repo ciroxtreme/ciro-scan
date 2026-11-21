@@ -415,21 +415,26 @@ def _is_placeholder_uri(redacted):
 def classify_finding(data):
     """Kembalikan (bucket, reason): active / potential / noise."""
     det = data.get("DetectorName") or data.get("DetectorType") or "?"
-    verified = data.get("Verified")
-    if verified is True:
-        return "active", "Verified live oleh TruffleHog (API layanan asli dikontak)"
     meta = (data.get("SourceMetadata") or {}).get("Data") or {}
     git = meta.get("Git") or meta.get("Github") or {}
-    fpath = git.get("file") or ""
+    fpath = (git.get("file") or "").lower()
     redacted = (data.get("Redacted") or "").replace("\n", " ")
-    if det == "Box":
-        return "noise", "Box detector false positive"
+
+    # Filter NOISE dulu (Dependency & Test fixture buang ke noise meski verified)
     if "vendor/" in fpath or "node_modules/" in fpath:
         return "noise", "Dependency vendor / node_modules (bukan kode sendiri)"
+    if "test/fixtures/" in fpath or "/fixtures/" in fpath or "/mock/" in fpath:
+        return "noise", "Mock / Test fixture dummy key"
+    if det == "Box":
+        return "noise", "Box detector false positive"
     if det == "PrivateKey" and "boringssl" in fpath:
         return "noise", "Kunci test BoringSSL"
     if det == "URI" and _is_placeholder_uri(redacted):
         return "noise", "URI contoh/placeholder (example.com, user:pass@host, domain test)"
+
+    verified = data.get("Verified")
+    if verified is True:
+        return "active", "Verified live oleh TruffleHog (API layanan asli dikontak)"
     return "potential", "Belum terverifikasi tapi bentuknya kunci asli (lama/session/kredensial)"
 
 def safe_record(data, bucket, reason):
