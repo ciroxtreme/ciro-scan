@@ -47,6 +47,7 @@ AI_PATTERNS = {
     "Claude": re.compile(r"sk-ant-(?:api03|oat01)-[a-zA-Z0-9_\-]{40,110}"),
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9_\-]{48,160}"),
     "DeepSeek": re.compile(r"sk-[a-f0-9]{32}"),
+    "Qwen": re.compile(r"sk-[a-f0-9]{32}"),
     "Gemini": re.compile(r"AIzaSy[a-zA-Z0-9_\-]{33}"),
     "Grok": re.compile(r"xai-[a-zA-Z0-9_\-]{40,80}"),
     "Groq": re.compile(r"gsk_[a-zA-Z0-9_\-]{48,64}"),
@@ -245,15 +246,24 @@ def validate_key_live(provider, key, extra=None):
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status == 200, "Aktif (Google AI Studio)"
         elif provider == "DeepSeek":
-            url = "https://api.deepseek.com/models"
-            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"})
+            url = "https://api.deepseek.com/user/balance"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0", "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status == 200, "Aktif"
+                bdata = json.loads(resp.read().decode())
+                if bdata.get("is_available"):
+                    return True, "Aktif (Saldo Berisi)"
+                else:
+                    return False, "Saldo $0 / Habis"
         elif provider == "Groq":
             url = "https://api.groq.com/openai/v1/models"
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status == 200, "Aktif (Groq Cloud)"
+        elif provider == "Qwen":
+            url = "https://dashscope.aliyuncs.com/compatible-mode/v1/models"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status == 200, "Aktif (Alibaba DashScope Qwen)"
 
     except urllib.error.HTTPError as e:
         if e.code == 429:
@@ -272,6 +282,8 @@ def main():
         "filename:mcp.json ANTHROPIC_API_KEY",
         "filename:mcp.json OPENAI_API_KEY",
         "filename:.env DEEPSEEK_API_KEY sk-",
+        "filename:.env DASHSCOPE_API_KEY sk-",
+        "filename:.env QWEN_API_KEY sk-",
         "filename:.env GEMINI_API_KEY AIzaSy",
         "filename:.env GROQ_API_KEY gsk_",
     ]
