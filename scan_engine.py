@@ -109,17 +109,40 @@ def _parse_search_keyword():
 SEARCH_KEYWORD = _parse_search_keyword()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1936436999")
-GH_PAT = os.getenv("GH_PAT", "")
+GH_PATS_RAW = os.getenv("GH_PAT", "")
+GH_PATS = [p.strip() for p in GH_PATS_RAW.split(",") if p.strip()]
+for env_k in ["GH_PAT_1", "GH_PAT_2", "GH_PAT_3"]:
+    val = os.getenv(env_k, "").strip()
+    if val and val not in GH_PATS:
+        GH_PATS.append(val)
 
-# === [DORK] === Helper API GitHub dengan rate-limit handling (dipakai semua mode)
-def _gh_api_get(url, retries=2):
+_pat_index = 0
+def get_next_gh_token():
+    global _pat_index
+    if not GH_PATS:
+        return ""
+    tok = GH_PATS[_pat_index % len(GH_PATS)]
+    _pat_index += 1
+    return tok
+
+GH_PAT = GH_PATS[0] if GH_PATS else ""
+
+# === [DORK] === Helper API GitHub dengan rate-limit & multi-token rotation
+def _gh_api_get(url, retries=None):
+    if retries is None:
+        retries = max(2, len(GH_PATS))
     headers = {"User-Agent": "CiroScan-BatchEngine", "Accept": "application/vnd.github+json"}
-    if GH_PAT:
-        headers["Authorization"] = f"Bearer {GH_PAT}"
     for attempt in range(retries + 1):
+        tok = get_next_gh_token()
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
         try:
             resp = requests.get(url, headers=headers, timeout=20)
-            if resp.status_code in (403, 429) and attempt < retries:
+            if resp.status_code in (401, 403, 429) and attempt < retries:
+                if len(GH_PATS) > 1:
+                    print(f"🔄 Token GitHub kena {resp.status_code}, rotasi otomatis ke token berikutnya ({attempt+1}/{retries})...")
+                    time.sleep(2)
+                    continue
                 reset = int(resp.headers.get("X-RateLimit-Reset", "0") or 0)
                 wait = min(max(reset - time.time() + 2, 5), 180)
                 print(f"⏳ Rate limit kena, jeda {int(wait)}s lalu retry...")
@@ -129,7 +152,7 @@ def _gh_api_get(url, retries=2):
             return resp.json()
         except Exception as e:
             if attempt < retries:
-                time.sleep(3)
+                time.sleep(2)
                 continue
             print(f"⚠️ API gagal ({url}): {e}")
             return None
@@ -140,26 +163,32 @@ def _gh_api_get(url, retries=2):
 # file sensitif (.env, id_rsa, dll.) di SELURUH GitHub publik — bukan cuma yang
 # aktif di feed. Hasilnya langsung diserahkan ke pipeline TruffleHog yang ada.
 # ===========================================================================
-def _gh_code_search(query, retries=2, page=None):
+def _gh_code_search(query, retries=None, page=None):
     """Satu query code search dengan random page & retry. Return list item hasil."""
-    if not GH_PAT:
+    if not GH_PATS:
         print("❌ Mode DORK WAJIB pakai GH_PAT (code search tidak bisa anonymous).")
         return None
+    if retries is None:
+        retries = max(2, len(GH_PATS))
     headers = {
         "User-Agent": "CiroScan-BatchEngine",
         "Accept": "application/vnd.github.text-match+json",
     }
-    if GH_PAT:
-        headers["Authorization"] = f"Bearer {GH_PAT}"
     
     target_page = page if page is not None else random.randint(1, 3)
     params = {"q": query, "per_page": 100, "page": target_page}
     for attempt in range(retries + 1):
+        tok = get_next_gh_token()
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
         try:
             resp = requests.get("https://api.github.com/search/code",
                                 headers=headers, params=params, timeout=25)
-            # Code search rate limit = 10 req/menit → kalau kena, tunggu reset
-            if resp.status_code in (403, 429) and attempt < retries:
+            if resp.status_code in (401, 403, 429) and attempt < retries:
+                if len(GH_PATS) > 1:
+                    print(f"🔄 Code search token kena {resp.status_code}, rotasi otomatis ke token berikutnya ({attempt+1}/{retries})...")
+                    time.sleep(2)
+                    continue
                 reset = int(resp.headers.get("X-RateLimit-Reset", "0") or 0)
                 wait = min(max(reset - time.time() + 2, 7), 90)
                 print(f"⏳ Search rate limit kena untuk query ini, jeda {int(wait)}s...")
@@ -169,7 +198,7 @@ def _gh_code_search(query, retries=2, page=None):
             return resp.json().get("items", [])
         except Exception as e:
             if attempt < retries:
-                time.sleep(7)  # jeda aman utk 10 req/menit
+                time.sleep(3)
                 continue
             print(f"⚠️ Code search gagal ({query!r}): {e}")
             return None
@@ -293,7 +322,7 @@ def collect_targets_from_dork():
     for q in picked_queries:
         print(f"   • {q}")
 
-    if not GH_PAT:
+    if not GH_PATS:
         send_telegram_text("❌ <b>Mode DORK gagal</b> — GH_PAT wajib diisi di secrets untuk code search.")
         return [], []
 
@@ -550,17 +579,11 @@ def resolve_target_repos(target_str):
         owner = m_user.group(1)
         print(f"🌐 Mendeteksi target sebagai AKUN PENGGUNA/ORGANISASI: {owner}")
         api_url = f"https://api.github.com/users/{owner}/repos?per_page=100&type=public"
-        headers = {"User-Agent": "CiroScan-BatchEngine"}
-        if GH_PAT:
-            headers["Authorization"] = f"token {GH_PAT}"
-
         urls = []
         try:
             page = 1
             while True:
-                req = urllib.request.Request(f"{api_url}&page={page}", headers=headers)
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    repos_data = json.loads(resp.read().decode())
+                repos_data = _gh_api_get(f"{api_url}&page={page}")
                 if not repos_data:
                     break
                 urls.extend(r["html_url"] for r in repos_data if not r.get("fork"))
