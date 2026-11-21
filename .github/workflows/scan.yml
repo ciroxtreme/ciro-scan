@@ -71,4 +71,4 @@ jobs:
             findings_potential.json
             findings_noise.json
             text_search_results.json
-                      if-no-files-found: ignore
+          if-no-files-found: ignore
