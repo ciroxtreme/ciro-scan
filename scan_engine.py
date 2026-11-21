@@ -44,15 +44,42 @@ DORK_MAX_REPOS = int(os.getenv("DORK_MAX_REPOS", "15"))              # plafon re
 DORK_MAX_REPO_SIZE_KB = int(os.getenv("DORK_MAX_REPO_SIZE_KB", "200000"))  # skip repo raksasa (clone lama)
 # Query default kalau env tidak diisi — set aman & terbukti produktif
 DORK_DEFAULT_QUERIES = [
-    "filename:.npmrc _authToken",
-    "filename:.env AWS_SECRET_ACCESS_KEY",
+    # 1. Kunci SSH privat — hampir selalu asli kalau ke-commit
     "filename:id_rsa",
+
+    # 2. Token npm — auto-verified TruffleHog, sering lupa ke-commit
+    "filename:.npmrc _authToken",
+
+    # 3. .git-credentials — plain username:password GitHub
+    "filename:.git-credentials",
+
+    # 4. GCP service account key — presisi, jarang placeholder
+    "filename:credentials.json type service_account",
+
+    # 5. WordPress config — DB password production
     "filename:wp-config.php DB_PASSWORD",
+
+    # 6. Private key TLS (.pem) — exclude template/test
+    "extension:pem \"PRIVATE KEY\" -example -test",
+
+    # 7. AWS di .env — verifikasi cepat via AWS API
+    "filename:.env AWS_SECRET_ACCESS_KEY",
+
+    # 8. Jenkins credentials — jarang tapi kalau dapet = server prod
     "filename:credentials.xml password",
-    "filename:settings.py SECRET_KEY",
+
+    # 9. Terraform tfvars — infra prod, sering lolos .gitignore
     "filename:terraform.tfvars password",
-    "filename:.env MAIL_PASSWORD",
+    "OPENAI_API_KEY=sk-",
+    "Filename:.env OPENAI_API_KEY",
+    "filename:.bashrc OPENAI",
+    "filename:config.json openai ai_config",
+    "filename:apikey.txt",
+
+    # 10. .netrc — plain text login, hampir 100% real
+    "filename:.netrc password",
 ]
+
 
 def _parse_search_keyword():
     """Ambil kata kunci pencarian teks bebas dari CLI (--search / -bebas) atau env."""
