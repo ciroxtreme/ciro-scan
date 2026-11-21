@@ -7,7 +7,6 @@
  * - GH_OWNER           : Akun GitHub (ciroxtreme)
  * - GH_REPO            : Nama repo (ciro-scan)
  * - ALLOWED_CHAT_ID    : ID Telegram Tuan Ciro (1936436999)
- * - SCAN_KEY           : Kunci rahasia buat endpoint /scan (?key=...) — wajib diset, kalau kosong /scan ditolak
  */
 
 export default {
@@ -20,10 +19,6 @@ export default {
     if (url.pathname === "/scan") {
       const targetUrl = url.searchParams.get("url");
       const keyword = url.searchParams.get("keyword") || "";
-      const key = url.searchParams.get("key") || "";
-      if (!env.SCAN_KEY || key !== env.SCAN_KEY) {
-        return new Response("Forbidden: /scan butuh ?key= yang sama dengan secret SCAN_KEY di Worker.", { status: 403 });
-      }
       if (!targetUrl) {
         return new Response("Missing 'url' parameter", { status: 400 });
       }
