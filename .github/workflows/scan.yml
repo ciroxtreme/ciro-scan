@@ -18,9 +18,58 @@ on:
 
 
 jobs:
-  trufflehog-scan:
+  collect:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Repo Scanner
+        uses: actions/checkout@v4
+
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+
+      - name: Install Dependencies
+        run: |
+          pip install --no-cache-dir requests
+
+
+      - name: Collect Targets
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url || 'feed' }}
+          SEARCH_KEYWORD: ${{ github.event.inputs.search_keyword || '' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          COLLECT_ONLY: "1"
+          FEED_EVENT_PAGES: "5"
+          FEED_MAX_USERS: "50"
+          FEED_MAX_REPOS_PER_USER: "3"
+          FEED_MAX_TOTAL_REPOS: "100"
+          DORK_MAX_REPOS: "100"
+        run: |
+          python -u scan_engine.py "$TARGET_URL"
+
+
+      - name: Upload Targets Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-targets
+          path: targets.json
+          if-no-files-found: error
+
+
+  scan:
+    needs: collect
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - name: Checkout Repo Scanner
         uses: actions/checkout@v4
@@ -44,15 +93,21 @@ jobs:
           trufflehog --version
 
 
-      - name: Execute Security Scan & Telegram Dispatch
+      - name: Download Targets
+        uses: actions/download-artifact@v4
+        with:
+          name: scan-targets
+
+
+      - name: Scan Shard
         env:
           TARGET_URL: ${{ github.event.inputs.target_url || 'feed' }}
           SEARCH_KEYWORD: ${{ github.event.inputs.search_keyword || '' }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_PAT: ${{ secrets.GH_PAT }}
-          FEED_EVENT_PAGES: "3"
-          FEED_MAX_USERS: "34"
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: "4"
+          TARGETS_FILE: targets.json
+          FEED_MAX_USERS: "50"
           FEED_MAX_REPOS_PER_USER: "3"
           FEED_MAX_TOTAL_REPOS: "100"
           REPO_SCAN_TIMEOUT: "300"
@@ -62,7 +117,67 @@ jobs:
           python -u scan_engine.py "$TARGET_URL"
 
 
-      - name: Upload Scan Artifacts
+      - name: Upload Shard Findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-findings-shard-${{ matrix.shard }}
+          path: |
+            findings_active_shard${{ matrix.shard }}.json
+            findings_potential_shard${{ matrix.shard }}.json
+            findings_noise_shard${{ matrix.shard }}.json
+            text_search_results_shard${{ matrix.shard }}.json
+            scan_summary_shard${{ matrix.shard }}.json
+          if-no-files-found: ignore
+
+
+  report:
+    needs: [collect, scan]
+    if: always()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Repo Scanner
+        uses: actions/checkout@v4
+
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+
+      - name: Install Dependencies
+        run: |
+          pip install --no-cache-dir requests
+
+
+      - name: Download Targets
+        uses: actions/download-artifact@v4
+        with:
+          name: scan-targets
+
+
+      - name: Download Shard Findings
+        uses: actions/download-artifact@v4
+        with:
+          pattern: scan-findings-shard-*
+          merge-multiple: true
+
+
+      - name: Merge & Report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MERGE_ONLY: "1"
+          SHARD_TOTAL: "4"
+          TARGETS_FILE: targets.json
+          SEARCH_KEYWORD: ${{ github.event.inputs.search_keyword || '' }}
+        run: |
+          python -u scan_engine.py
+
+
+      - name: Upload Merged Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
