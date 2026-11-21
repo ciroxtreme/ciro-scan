@@ -1,10 +1,65 @@
-      - name: Feed-Hunt Scan (auto dari feed global)
+name: TruffleHog Security Scanner
+
+on:
+  schedule:
+    # Scan santai feed global otomatis tiap 6 jam
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "URL target repo Git / username / kata "feed" untuk scan feed global"
+        required: true
+        default: "feed"
+      search_keyword:
+        description: "Kata kunci pencarian teks bebas -bebas (kosongkan untuk scan TruffleHog biasa)"
+        required: false
+        default: ""
+
+jobs:
+  trufflehog-scan:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repo Scanner
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          pip install --no-cache-dir requests
+
+      - name: Install Official TruffleHog
+        run: |
+          echo "📥 Mengunduh biner TruffleHog terbaru..."
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sudo sh -s -- -b /usr/local/bin
+          trufflehog --version
+
+      - name: Execute Security Scan & Telegram Dispatch
         env:
+          TARGET_URL: ${{ github.event.inputs.target_url || (github.event_name == 'schedule' && 'feed' || 'feed') }}
+          SEARCH_KEYWORD: ${{ github.event.inputs.search_keyword || '' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_PAT: ${{ secrets.GH_PAT }}
-          FEED_MODE: "1"
           FEED_EVENT_PAGES: "3"
           FEED_MAX_USERS: "8"
           FEED_MAX_REPOS_PER_USER: "2"
           FEED_MAX_TOTAL_REPOS: "12"
-        run: python scanner.py feed
+        run: |
+          python -u scan_engine.py "$TARGET_URL"
+
+      - name: Upload Scan Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-report-json
+          path: |
+            findings_active.json
+            findings_potential.json
+            findings_noise.json
+            text_search_results.json
+          if-no-files-found: ignore
