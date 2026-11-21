@@ -1,0 +1,35 @@
+name: Operation Kuras Anthropic Claude
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"  # Rutin sapu dalam tiap 2 jam
+  workflow_dispatch:
+
+jobs:
+  kuras-claude:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Claude Deep Slicing Dredger
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -u claude_deep_dredger.py
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: findings-claude-gold
+          path: findings_claude_gold.json
+          if-no-files-found: ignore
