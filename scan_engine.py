@@ -130,18 +130,21 @@ def _gh_api_get(url, retries=2):
 # file sensitif (.env, id_rsa, dll.) di SELURUH GitHub publik — bukan cuma yang
 # aktif di feed. Hasilnya langsung diserahkan ke pipeline TruffleHog yang ada.
 # ===========================================================================
-def _gh_code_search(query, retries=2):
-    """Satu query code search. Return list item hasil (atau None kalau gagal total)."""
+def _gh_code_search(query, retries=2, page=None):
+    """Satu query code search dengan random page & retry. Return list item hasil."""
     if not GH_PAT:
         print("❌ Mode DORK WAJIB pakai GH_PAT (code search tidak bisa anonymous).")
         return None
     headers = {
         "User-Agent": "CiroScan-BatchEngine",
-        "Accept": "application/vnd.github.text-match+json",  # bawa snippet text-match
+        "Accept": "application/vnd.github.text-match+json",
     }
     if GH_PAT:
         headers["Authorization"] = f"Bearer {GH_PAT}"
-    params = {"q": query, "per_page": 100}
+    
+    # Acak page (1-3) jika tidak ditentukan agar hasil selalu variatif & fresh
+    target_page = page if page is not None else random.randint(1, 3)
+    params = {"q": query, "per_page": 100, "page": target_page}
     for attempt in range(retries + 1):
         try:
             resp = requests.get("https://api.github.com/search/code",
@@ -185,6 +188,89 @@ def _dork_item_useful(item):
             return False
     return True
 
+
+# === [CACHE / HISTORY PERSISTENCE] =========================================
+# Menyimpan riwayat repo & user yang pernah discan di GitHub branch 'state'
+# agar scan selanjutnya tidak mengulang repo atau user yang sama (100% fresh).
+# ===========================================================================
+CACHE_BRANCH = "state"
+CACHE_FILE = "scanned_history.json"
+
+def _load_scanned_history():
+    """Baca set repo & user yang sudah pernah discan dari remote branch 'state'."""
+    scanned_repos = set()
+    scanned_users = set()
+    sha = None
+    if not GH_PAT:
+        return scanned_repos, scanned_users, sha
+    
+    owner = os.getenv("GITHUB_REPOSITORY_OWNER") or "ciroxtreme"
+    repo_name = (os.getenv("GITHUB_REPOSITORY") or "ciroxtreme/ciro-scan").split("/")[-1]
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{CACHE_FILE}?ref={CACHE_BRANCH}"
+    headers = {
+        "Authorization": f"Bearer {GH_PAT}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "CiroScan-CacheEngine"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            import base64
+            data = resp.json()
+            sha = data.get("sha")
+            raw_content = base64.b64decode(data.get("content", "")).decode("utf-8")
+            hist = json.loads(raw_content)
+            scanned_repos = set(hist.get("repos", []))
+            scanned_users = set(hist.get("users", []))
+            print(f"📦 Riwayat Cache Termuat: {len(scanned_repos)} repo & {len(scanned_users)} user pernah discan.")
+    except Exception as e:
+        print(f"ℹ️ Info Cache: Memulai cache riwayat baru ({e}).")
+    return scanned_repos, scanned_users, sha
+
+def _save_scanned_history(new_scanned_repos, new_scanned_users, base_sha=None):
+    """Simpan akumulasi repo & user yang discan ke remote branch 'state'."""
+    if not GH_PAT or (not new_scanned_repos and not new_scanned_users):
+        return
+    import base64
+    owner = os.getenv("GITHUB_REPOSITORY_OWNER") or "ciroxtreme"
+    repo_name = (os.getenv("GITHUB_REPOSITORY") or "ciroxtreme/ciro-scan").split("/")[-1]
+    
+    # Reload fresh untuk hindari collision commit
+    existing_repos, existing_users, latest_sha = _load_scanned_history()
+    all_repos = sorted(list(existing_repos.union(new_scanned_repos)))
+    all_users = sorted(list(existing_users.union(new_scanned_users)))
+    
+    # Batasi memori cache maksimal 10,000 riwayat (FIFO rolling)
+    if len(all_repos) > 10000:
+        all_repos = all_repos[-10000:]
+    if len(all_users) > 5000:
+        all_users = all_users[-5000:]
+
+    payload_data = json.dumps({"repos": all_repos, "users": all_users}, indent=2)
+    b64_content = base64.b64encode(payload_data.encode("utf-8")).decode("utf-8")
+    
+    headers = {
+        "Authorization": f"Bearer {GH_PAT}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "CiroScan-CacheEngine"
+    }
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{CACHE_FILE}"
+    body = {
+        "message": f"chore(cache): update scanned history (+{len(new_scanned_repos)} repos)",
+        "content": b64_content,
+        "branch": CACHE_BRANCH
+    }
+    if latest_sha:
+        body["sha"] = latest_sha
+    try:
+        r = requests.put(url, headers=headers, json=body, timeout=20)
+        if r.status_code in (200, 201):
+            print(f"💾 Sukses simpan riwayat cache ke branch '{CACHE_BRANCH}'! (Total: {len(all_repos)} repo).")
+        else:
+            print(f"⚠️ Gagal update cache state ({r.status_code}): {r.text[:120]}")
+    except Exception as e:
+        print(f"⚠️ Gagal update cache branch: {e}")
+
 def collect_targets_from_dork():
     """Return (targets, dork_detail). dork_detail = info query → jml hasil."""
     queries = [q.strip() for q in DORK_QUERIES_RAW.split("|") if q.strip()] \
@@ -206,10 +292,13 @@ def collect_targets_from_dork():
 
     repo_urls = []      # urutan penemuan (dipertahankan, jangan sorted)
     seen = set()
+    
+    # Ambil riwayat repo & user yang pernah discan sebelumnya dari cache
+    history_repos, history_users, _ = _load_scanned_history()
+    seen.update(history_repos)
 
     # ASINKRON: semua query jalan PARALEL (query independen; rate limit
     # code search 30/menit, 3 query bersamaan masih jauh di bawah batas).
-    # Hasil digabung SESUAI URUTAN query (bukan urutan selesai) biar stabil.
     results_by_query = {}
     with ThreadPoolExecutor(max_workers=min(n, DORK_QUERY_WORKERS)) as ex:
         fut2q = {ex.submit(_gh_code_search, q): q for q in picked_queries}
@@ -217,10 +306,10 @@ def collect_targets_from_dork():
             results_by_query[fut2q[fut]] = fut.result()
 
     # BAGI RATA: kumpulkan kandidat per query dulu, lalu ambil GILIRAN
-    # (round-robin: 1 repo per query per putaran) — tiap query dapat jatah
-    # yang sama; kalau satu query habis duluan, sisa slot dipakai query lain.
-    per_query_candidates = []   # [(query, [full_name, ...]), ...] sesuai urutan query
+    # Filter ketat: BUANG repo yang sudah ada di riwayat cache!
+    per_query_candidates = []
     error_queries = set()
+    skipped_history_count = 0
     for query in picked_queries:
         items = results_by_query.get(query)
         if items is None:
@@ -231,11 +320,18 @@ def collect_targets_from_dork():
             if not _dork_item_useful(item):
                 continue
             full_name = (item.get("repository") or {}).get("full_name")
-            if not full_name or full_name in seen:
+            if not full_name:
                 continue
-            seen.add(full_name)   # dedup global: query awal yang menang
+            owner_user = full_name.split("/")[0] if "/" in full_name else ""
+            if full_name in seen or (owner_user and owner_user in history_users):
+                skipped_history_count += 1
+                continue
+            seen.add(full_name)   # dedup global
             cands.append(full_name)
         per_query_candidates.append((query, cands))
+    
+    if skipped_history_count > 0:
+        print(f"🛡️ Cache Filter: Berhasil memblokir {skipped_history_count} repo/user yang sudah pernah discan sebelumnya!")
 
     found_by_query = {q: 0 for q, _ in per_query_candidates}
     round_idx = 0
@@ -383,8 +479,13 @@ def collect_targets_from_feed():
         print("❌ Feed kosong — tidak ada user yang bisa dipicked.")
         return [], []
 
-    # JANGAN di-sorted: urutan dict = urutan pertama ketemu di feed (event terbaru dulu)
-    picked_users = list(users_seen.keys())[:FEED_MAX_USERS]
+    # Ambil riwayat cache agar user yang sudah pernah discan tidak diulang
+    _, history_users, _ = _load_scanned_history()
+    fresh_users = [u for u in users_seen.keys() if u not in history_users]
+    if len(fresh_users) < FEED_MAX_USERS:
+        # Fallback jika kehabisan user 100% fresh
+        fresh_users = list(users_seen.keys())
+    picked_users = fresh_users[:FEED_MAX_USERS]
     print(f"🎯 {len(users_seen)} user aktif terdeteksi, dipicked {len(picked_users)} user: "
           f"{', '.join(picked_users)}")
 
@@ -397,12 +498,22 @@ def collect_targets_from_feed():
         detail_by_user[u] = entry
 
     if FEED_MAX_REPOS_PER_USER > 1:
+        # ASINKRON PARALEL: Ambil daftar repo user secara bersamaan (super cepat)
+        def _fetch_user_repos(user):
+            data = _gh_api_get(f"https://api.github.com/users/{user}/repos?per_page=100&sort=pushed&type=owner")
+            return user, data
+
+        user_repos_map = {}
+        with ThreadPoolExecutor(max_workers=min(len(picked_users), 8)) as ex:
+            fut_map = {ex.submit(_fetch_user_repos, u): u for u in picked_users}
+            for fut in as_completed(fut_map):
+                u, repos = fut.result()
+                user_repos_map[u] = repos or []
+
         for u in picked_users:
             if len(targets) >= FEED_MAX_TOTAL_REPOS:
                 break
-            repos = _gh_api_get(f"https://api.github.com/users/{u}/repos?per_page=100&sort=pushed&type=owner")
-            if not repos:
-                continue
+            repos = user_repos_map.get(u, [])
             added = 0
             for r in repos:
                 if added >= FEED_MAX_REPOS_PER_USER - 1 or len(targets) >= FEED_MAX_TOTAL_REPOS:
@@ -845,6 +956,14 @@ def main():
         send_telegram_document("findings_active.json", f"🚨 File JSON Temuan AKTIF ({total_active}) — {report_target_label}")
     if total_potential > 0:
         send_telegram_document("findings_potential.json", f"⚠️ File JSON Temuan POTENSIAL ({total_potential}) — {report_target_label}")
+
+    # Simpan repo & user yang baru discan ke riwayat cache di branch 'state'
+    try:
+        new_repos_to_cache = {s.get("repo") for s in repo_summaries if s.get("repo")}
+        new_users_to_cache = {r.split("/")[0] for r in new_repos_to_cache if "/" in r}
+        _save_scanned_history(new_repos_to_cache, new_users_to_cache)
+    except Exception as ce:
+        print(f"⚠️ Gagal simpan riwayat cache: {ce}")
 
     if failed_repos:
         print(f"❌ {len(failed_repos)} repo gagal discan, keluar dengan error.")

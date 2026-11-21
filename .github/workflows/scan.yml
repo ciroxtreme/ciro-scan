@@ -51,7 +51,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_PAT: ${{ secrets.GH_PAT }}
-          FEED_EVENT_PAGES: "5"
+          FEED_EVENT_PAGES: "3"
           FEED_MAX_USERS: "34"
           FEED_MAX_REPOS_PER_USER: "3"
           FEED_MAX_TOTAL_REPOS: "100"
