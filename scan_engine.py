@@ -54,47 +54,31 @@ DORK_MAX_REPO_SIZE_KB = int(os.getenv("DORK_MAX_REPO_SIZE_KB", "200000"))  # ski
 DORK_QUERY_WORKERS = int(os.getenv("DORK_QUERY_WORKERS", "4"))              # query dork jalan paralel (maks 4 bersamaan)
 # Query default kalau env tidak diisi — set aman & terbukti produktif
 DORK_DEFAULT_QUERIES = [
-    # === 1. GOOGLE GEMINI / AI STUDIO / VERTEX ===
-    # Format: AIzaSy... (39 karakter)
-    "filename:.env GEMINI_API_KEY AIzaSy",
-    "filename:.env GOOGLE_API_KEY AIzaSy",
-    "filename:config.json AIzaSy",
-    "filename:.bashrc GEMINI_API_KEY",
+    # === 1. SULTAN AZURE OPENAI ENTERPRISE (Cluster K8s & Infra Prod) ===
+    "filename:values.yaml azureOpenAIApiKey",
+    "filename:helm AZURE_OPENAI_KEY",
+    "filename:.env AZURE_OPENAI_API_KEY openai.azure.com",
+    "filename:docker-compose.yml AZURE_OPENAI_API_KEY",
 
-    # === 2. ANTHROPIC CLAUDE ===
-    # Format: sk-ant-api03-... / sk-ant-...
-    "filename:.env ANTHROPIC_API_KEY sk-ant",
-    "filename:.env CLAUDE_API_KEY sk-ant",
-    "ANTHROPIC_API_KEY=sk-ant-api03-",
+    # === 2. SULTAN AWS BEDROCK (Akun Enterprise / AWS Org) ===
+    "filename:.env AWS_BEDROCK_API_KEY",
+    "filename:.env BEDROCK_ASSUME_ROLE_ARN",
+    "filename:terraform.tfvars aws_bedrock",
 
-    # === 3. OPENAI / CHATGPT ===
-    # Format: sk-proj-... / sk-...
-    "filename:.env OPENAI_API_KEY sk-proj-",
-    "filename:.env OPENAI_API_KEY sk-",
-    "OPENAI_API_KEY=sk-proj-",
+    # === 3. SULTAN ANTHROPIC CLAUDE PRODUCTION (Organisasi Berbayar) ===
+    "filename:docker-compose.yml ANTHROPIC_API_KEY sk-ant",
+    "filename:values.yaml ANTHROPIC_API_KEY",
+    "filename:.env.production ANTHROPIC_API_KEY sk-ant",
 
-    # === 4. XAI GROK ===
-    # Format: xai-...
-    "filename:.env XAI_API_KEY xai-",
-    "filename:.env GROK_API_KEY xai-",
+    # === 4. SULTAN OPENAI ENTERPRISE / TIER 5 (Organisasi Skala Besar) ===
+    "filename:docker-compose.yml OPENAI_API_KEY sk-proj-",
+    "filename:.env.production OPENAI_API_KEY sk-proj-",
+    "filename:kustomization.yaml OPENAI_API_KEY",
 
-    # === 5. ALIBABA CLOUD / QWEN (DASHSCOPE) ===
-    # Format: sk-... (DashScope API Key untuk model Qwen)
-    "filename:.env DASHSCOPE_API_KEY sk-",
-    "filename:.env QWEN_API_KEY sk-",
-
-    # === 6. AZURE OPENAI ===
-    # Format: 32 hex chars + endpoint openai.azure.com
-    "filename:.env AZURE_OPENAI_API_KEY",
-    "filename:.env AZURE_OPENAI_ENDPOINT",
-    "filename:r2r.yaml AZURE_API_KEY",
-
-    # === 7. GENERAL AI MULTI-KEY / ENV FILE HUNT ===
-    "filename:.env LLM_API_KEY",
-    "filename:.env COHERE_API_KEY",
-    "filename:.env MISTRAL_API_KEY",
-    "filename:.env GROQ_API_KEY gsk_",
-    "filename:.env DEEPSEEK_API_KEY sk-",
+    # === 5. SULTAN LLM INFRASTRUCTURE (Perplexity Pro, Cohere Enterprise, Groq Tier 3) ===
+    "filename:.env.production PERPLEXITY_API_KEY pplx-",
+    "filename:docker-compose.yml COHERE_API_KEY",
+    "filename:.env.production GROQ_API_KEY gsk_",
 ]
 
 
