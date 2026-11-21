@@ -206,7 +206,6 @@ def collect_targets_from_dork():
 
     repo_urls = []      # urutan penemuan (dipertahankan, jangan sorted)
     seen = set()
-    dork_detail = []
 
     # ASINKRON: semua query jalan PARALEL (query independen; rate limit
     # code search 30/menit, 3 query bersamaan masih jauh di bawah batas).
@@ -217,28 +216,52 @@ def collect_targets_from_dork():
         for fut in as_completed(fut2q):
             results_by_query[fut2q[fut]] = fut.result()
 
-    for qi, query in enumerate(picked_queries, 1):
+    # BAGI RATA: kumpulkan kandidat per query dulu, lalu ambil GILIRAN
+    # (round-robin: 1 repo per query per putaran) — tiap query dapat jatah
+    # yang sama; kalau satu query habis duluan, sisa slot dipakai query lain.
+    per_query_candidates = []   # [(query, [full_name, ...]), ...] sesuai urutan query
+    error_queries = set()
+    for query in picked_queries:
         items = results_by_query.get(query)
         if items is None:
-            dork_detail.append({"query": query, "found": 0, "error": True})
+            error_queries.add(query)
             continue
-        added = 0
+        cands = []
         for item in items:
-            if len(repo_urls) >= DORK_MAX_REPOS:
-                break
             if not _dork_item_useful(item):
                 continue
             full_name = (item.get("repository") or {}).get("full_name")
             if not full_name or full_name in seen:
                 continue
-            seen.add(full_name)
-            repo_urls.append(f"https://github.com/{full_name}")
-            added += 1
-        dork_detail.append({"query": query, "found": added})
-        print(f"   → [{qi}/{n}] {added} repo kandidat dari: {query}")
-        if len(repo_urls) >= DORK_MAX_REPOS:
-            print(f"   🛑 Plafon {DORK_MAX_REPOS} repo tercapai.")
+            seen.add(full_name)   # dedup global: query awal yang menang
+            cands.append(full_name)
+        per_query_candidates.append((query, cands))
+
+    found_by_query = {q: 0 for q, _ in per_query_candidates}
+    round_idx = 0
+    while len(repo_urls) < DORK_MAX_REPOS:
+        progressed = False
+        for query, cands in per_query_candidates:
+            if len(repo_urls) >= DORK_MAX_REPOS:
+                break
+            if round_idx < len(cands):
+                repo_urls.append(f"https://github.com/{cands[round_idx]}")
+                found_by_query[query] += 1
+                progressed = True
+        round_idx += 1
+        if not progressed:
             break
+
+    dork_detail = []
+    for qi, query in enumerate(picked_queries, 1):
+        if query in error_queries:
+            dork_detail.append({"query": query, "found": 0, "error": True})
+            continue
+        found = found_by_query.get(query, 0)
+        dork_detail.append({"query": query, "found": found})
+        print(f"   → [{qi}/{n}] {found} repo kandidat dari: {query}")
+    if len(repo_urls) >= DORK_MAX_REPOS:
+        print(f"   🛑 Plafon {DORK_MAX_REPOS} repo tercapai (bagi rata {n} query).")
 
     repo_urls = repo_urls[:DORK_MAX_REPOS]
     if repo_urls:
