@@ -1,8 +1,10 @@
 name: TruffleHog Security Scanner
 
+
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *"→ Runs at 0 minutes past the hour, every 6 hours
+
   workflow_dispatch:
     inputs:
       target_url:
@@ -14,28 +16,33 @@ on:
         required: false
         default: ""
 
+
 jobs:
   trufflehog-scan:
     runs-on: ubuntu-22.04
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - name: Checkout Repo Scanner
         uses: actions/checkout@v4
+
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+
       - name: Install Dependencies
         run: |
           pip install --no-cache-dir requests
+
 
       - name: Install Official TruffleHog
         run: |
           echo "📥 Mengunduh biner TruffleHog terbaru..."
           curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sudo sh -s -- -b /usr/local/bin
           trufflehog --version
+
 
       - name: Execute Security Scan & Telegram Dispatch
         env:
@@ -48,10 +55,11 @@ jobs:
           FEED_MAX_USERS: "25"
           FEED_MAX_REPOS_PER_USER: "3"
           FEED_MAX_TOTAL_REPOS: "50"
-          REPO_SCAN_TIMEOUT: "120"
+          REPO_SCAN_TIMEOUT: "300"
           CONCURRENCY_WORKERS: "5"
         run: |
           python -u scan_engine.py "$TARGET_URL"
+
 
       - name: Upload Scan Artifacts
         if: always()
@@ -62,5 +70,3 @@ jobs:
             findings_active.json
             findings_potential.json
             findings_noise.json
-            text_search_results.json
-          if-no-files-found: ignore
