@@ -20,7 +20,7 @@ on:
 jobs:
   trufflehog-scan:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout Repo Scanner
         uses: actions/checkout@v4
@@ -56,7 +56,8 @@ jobs:
           FEED_MAX_REPOS_PER_USER: "3"
           FEED_MAX_TOTAL_REPOS: "50"
           REPO_SCAN_TIMEOUT: "300"
-          CONCURRENCY_WORKERS: "5"
+          CONCURRENCY_WORKERS: "10"
+          DORK_MAX_REPOS: "100"
         run: |
           python -u scan_engine.py "$TARGET_URL"
 
