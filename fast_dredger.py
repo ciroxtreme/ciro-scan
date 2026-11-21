@@ -245,10 +245,12 @@ def validate_key_live(provider, key, extra=None):
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status == 200, "Aktif & Terdaftar"
         elif provider == "Gemini":
-            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            # Cek generateContent langsung: buang semua free tier yang terkena rate limit
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}"
+            payload = json.dumps({"contents": [{"parts": [{"text": "ping"}]}]}).encode()
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status == 200, "Aktif (Google AI Studio)"
+                return resp.status == 200, "Aktif (Gemini Pay-As-You-Go / Aktif)"
         elif provider == "DeepSeek":
             url = "https://api.deepseek.com/user/balance"
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0", "Accept": "application/json"})
@@ -284,6 +286,8 @@ def validate_key_live(provider, key, extra=None):
 
     except urllib.error.HTTPError as e:
         if e.code == 429:
+            if provider == "Gemini":
+                return False, "Free Tier Rate-Limited (429)"
             return True, "Aktif (Rate Limit / Terpakai)"
         elif e.code == 402:
             return False, "Saldo $0 / Habis (402)"
