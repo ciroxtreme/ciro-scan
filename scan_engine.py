@@ -54,40 +54,47 @@ DORK_MAX_REPO_SIZE_KB = int(os.getenv("DORK_MAX_REPO_SIZE_KB", "200000"))  # ski
 DORK_QUERY_WORKERS = int(os.getenv("DORK_QUERY_WORKERS", "4"))              # query dork jalan paralel (maks 4 bersamaan)
 # Query default kalau env tidak diisi — set aman & terbukti produktif
 DORK_DEFAULT_QUERIES = [
-    # 1. Kunci SSH privat — hampir selalu asli kalau ke-commit
-    "filename:id_rsa",
+    # === 1. GOOGLE GEMINI / AI STUDIO / VERTEX ===
+    # Format: AIzaSy... (39 karakter)
+    "filename:.env GEMINI_API_KEY AIzaSy",
+    "filename:.env GOOGLE_API_KEY AIzaSy",
+    "filename:config.json AIzaSy",
+    "filename:.bashrc GEMINI_API_KEY",
 
-    # 2. Token npm — auto-verified TruffleHog, sering lupa ke-commit
-    "filename:.npmrc _authToken",
+    # === 2. ANTHROPIC CLAUDE ===
+    # Format: sk-ant-api03-... / sk-ant-...
+    "filename:.env ANTHROPIC_API_KEY sk-ant",
+    "filename:.env CLAUDE_API_KEY sk-ant",
+    "ANTHROPIC_API_KEY=sk-ant-api03-",
 
-    # 3. .git-credentials — plain username:password GitHub
-    "filename:.git-credentials",
+    # === 3. OPENAI / CHATGPT ===
+    # Format: sk-proj-... / sk-...
+    "filename:.env OPENAI_API_KEY sk-proj-",
+    "filename:.env OPENAI_API_KEY sk-",
+    "OPENAI_API_KEY=sk-proj-",
 
-    # 4. GCP service account key — presisi, jarang placeholder
-    "filename:credentials.json type service_account",
+    # === 4. XAI GROK ===
+    # Format: xai-...
+    "filename:.env XAI_API_KEY xai-",
+    "filename:.env GROK_API_KEY xai-",
 
-    # 5. WordPress config — DB password production
-    "filename:wp-config.php DB_PASSWORD",
+    # === 5. ALIBABA CLOUD / QWEN (DASHSCOPE) ===
+    # Format: sk-... (DashScope API Key untuk model Qwen)
+    "filename:.env DASHSCOPE_API_KEY sk-",
+    "filename:.env QWEN_API_KEY sk-",
 
-    # 6. Private key TLS (.pem) — exclude template/test
-    "extension:pem \"PRIVATE KEY\" -example -test",
+    # === 6. AZURE OPENAI ===
+    # Format: 32 hex chars + endpoint openai.azure.com
+    "filename:.env AZURE_OPENAI_API_KEY",
+    "filename:.env AZURE_OPENAI_ENDPOINT",
+    "filename:r2r.yaml AZURE_API_KEY",
 
-    # 7. AWS di .env — verifikasi cepat via AWS API
-    "filename:.env AWS_SECRET_ACCESS_KEY",
-
-    # 8. Jenkins credentials — jarang tapi kalau dapet = server prod
-    "filename:credentials.xml password",
-
-    # 9. Terraform tfvars — infra prod, sering lolos .gitignore
-    "filename:terraform.tfvars password",
-    "OPENAI_API_KEY=sk-",
-    "Filename:.env OPENAI_API_KEY",
-    "filename:.bashrc OPENAI",
-    "filename:config.json openai ai_config",
-    "filename:apikey.txt",
-
-    # 10. .netrc — plain text login, hampir 100% real
-    "filename:.netrc password",
+    # === 7. GENERAL AI MULTI-KEY / ENV FILE HUNT ===
+    "filename:.env LLM_API_KEY",
+    "filename:.env COHERE_API_KEY",
+    "filename:.env MISTRAL_API_KEY",
+    "filename:.env GROQ_API_KEY gsk_",
+    "filename:.env DEEPSEEK_API_KEY sk-",
 ]
 
 
