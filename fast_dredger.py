@@ -51,7 +51,6 @@ AI_PATTERNS = {
     "Grok": re.compile(r"xai-[a-zA-Z0-9_\-]{40,80}"),
     "Groq": re.compile(r"gsk_[a-zA-Z0-9_\-]{48,64}"),
     "Perplexity": re.compile(r"pplx-[a-zA-Z0-9_\-]{48,64}"),
-    "Pinecone": re.compile(r"pcsk_[a-zA-Z0-9_\-]{60,85}"),
     "Deepgram": re.compile(r"\b[0-9a-f]{40}\b")
 }
 
@@ -255,11 +254,7 @@ def validate_key_live(provider, key, extra=None):
             req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status == 200, "Aktif (Groq Cloud)"
-        elif provider == "Pinecone":
-            url = "https://api.pinecone.io/indexes"
-            req = urllib.request.Request(url, headers={"Api-Key": key, "User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status == 200, "Aktif (Vector DB)"
+
     except urllib.error.HTTPError as e:
         if e.code == 429:
             return True, "Aktif (Rate Limit / Terpakai)"
@@ -279,7 +274,6 @@ def main():
         "filename:.env DEEPSEEK_API_KEY sk-",
         "filename:.env GEMINI_API_KEY AIzaSy",
         "filename:.env GROQ_API_KEY gsk_",
-        "filename:.env PINECONE_API_KEY pcsk_"
     ]
 
     print("🚀 MEMULAI OPERASI FAST DREDGER (SEDOT RAW HTTP INSTAN)...")
