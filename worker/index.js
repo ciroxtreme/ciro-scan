@@ -91,7 +91,7 @@ export default {
             await sendTelegram(
               chatId,
               `🛰️ <b>MEMICU FEED-HUNT SCAN!</b>\n\n` +
-              `📡 <b>Target:</b> 50 Repositori dari Event Publik GitHub Terbaru\n` +
+              `📡 <b>Target:</b> 100 Repositori dari Event Publik GitHub Terbaru\n` +
               `⏳ <i>Runner sedang disiapkan di GitHub Actions...</i>`,
               env
             );
