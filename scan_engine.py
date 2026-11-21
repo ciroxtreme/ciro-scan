@@ -28,6 +28,14 @@ FEED_MAX_REPOS_PER_USER = int(os.getenv("FEED_MAX_REPOS_PER_USER", "3"))
 FEED_MAX_TOTAL_REPOS = int(os.getenv("FEED_MAX_TOTAL_REPOS", "100"))
 REPO_SCAN_TIMEOUT = int(os.getenv("REPO_SCAN_TIMEOUT", "300"))
 CONCURRENCY_WORKERS = int(os.getenv("CONCURRENCY_WORKERS", "4"))
+FEED_FETCH_WORKERS = int(os.getenv("FEED_FETCH_WORKERS", "8"))  # fetch repo user paralel
+
+# === [SHARD] === Mode workflow matrix: collect-only / shard-scan / merge-only
+COLLECT_ONLY = os.getenv("COLLECT_ONLY", "").strip().lower() in ("1", "true", "yes")
+MERGE_ONLY = os.getenv("MERGE_ONLY", "").strip().lower() in ("1", "true", "yes")
+SHARD_INDEX = int(os.getenv("SHARD_INDEX", "-1"))   # -1 = bukan mode shard
+SHARD_TOTAL = int(os.getenv("SHARD_TOTAL", "1"))
+TARGETS_FILE = os.getenv("TARGETS_FILE", "targets.json")
 FEED_EXCLUDE = {u.strip().lower() for u in os.getenv("FEED_EXCLUDE", "").split(",") if u.strip()}
 
 # === [DORK] === Mode dork global: aktif kalau target = "dork", argumen --dork, atau env DORK_MODE
@@ -130,21 +138,18 @@ def _gh_api_get(url, retries=2):
 # file sensitif (.env, id_rsa, dll.) di SELURUH GitHub publik — bukan cuma yang
 # aktif di feed. Hasilnya langsung diserahkan ke pipeline TruffleHog yang ada.
 # ===========================================================================
-def _gh_code_search(query, retries=2, page=None):
-    """Satu query code search dengan random page & retry. Return list item hasil."""
+def _gh_code_search(query, retries=2):
+    """Satu query code search. Return list item hasil (atau None kalau gagal total)."""
     if not GH_PAT:
         print("❌ Mode DORK WAJIB pakai GH_PAT (code search tidak bisa anonymous).")
         return None
     headers = {
         "User-Agent": "CiroScan-BatchEngine",
-        "Accept": "application/vnd.github.text-match+json",
+        "Accept": "application/vnd.github.text-match+json",  # bawa snippet text-match
     }
     if GH_PAT:
         headers["Authorization"] = f"Bearer {GH_PAT}"
-    
-    # Acak page (1-3) jika tidak ditentukan agar hasil selalu variatif & fresh
-    target_page = page if page is not None else random.randint(1, 3)
-    params = {"q": query, "per_page": 100, "page": target_page}
+    params = {"q": query, "per_page": 100}
     for attempt in range(retries + 1):
         try:
             resp = requests.get("https://api.github.com/search/code",
@@ -188,89 +193,6 @@ def _dork_item_useful(item):
             return False
     return True
 
-
-# === [CACHE / HISTORY PERSISTENCE] =========================================
-# Menyimpan riwayat repo & user yang pernah discan di GitHub branch 'state'
-# agar scan selanjutnya tidak mengulang repo atau user yang sama (100% fresh).
-# ===========================================================================
-CACHE_BRANCH = "state"
-CACHE_FILE = "scanned_history.json"
-
-def _load_scanned_history():
-    """Baca set repo & user yang sudah pernah discan dari remote branch 'state'."""
-    scanned_repos = set()
-    scanned_users = set()
-    sha = None
-    if not GH_PAT:
-        return scanned_repos, scanned_users, sha
-    
-    owner = os.getenv("GITHUB_REPOSITORY_OWNER") or "ciroxtreme"
-    repo_name = (os.getenv("GITHUB_REPOSITORY") or "ciroxtreme/ciro-scan").split("/")[-1]
-    url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{CACHE_FILE}?ref={CACHE_BRANCH}"
-    headers = {
-        "Authorization": f"Bearer {GH_PAT}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "CiroScan-CacheEngine"
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            import base64
-            data = resp.json()
-            sha = data.get("sha")
-            raw_content = base64.b64decode(data.get("content", "")).decode("utf-8")
-            hist = json.loads(raw_content)
-            scanned_repos = set(hist.get("repos", []))
-            scanned_users = set(hist.get("users", []))
-            print(f"📦 Riwayat Cache Termuat: {len(scanned_repos)} repo & {len(scanned_users)} user pernah discan.")
-    except Exception as e:
-        print(f"ℹ️ Info Cache: Memulai cache riwayat baru ({e}).")
-    return scanned_repos, scanned_users, sha
-
-def _save_scanned_history(new_scanned_repos, new_scanned_users, base_sha=None):
-    """Simpan akumulasi repo & user yang discan ke remote branch 'state'."""
-    if not GH_PAT or (not new_scanned_repos and not new_scanned_users):
-        return
-    import base64
-    owner = os.getenv("GITHUB_REPOSITORY_OWNER") or "ciroxtreme"
-    repo_name = (os.getenv("GITHUB_REPOSITORY") or "ciroxtreme/ciro-scan").split("/")[-1]
-    
-    # Reload fresh untuk hindari collision commit
-    existing_repos, existing_users, latest_sha = _load_scanned_history()
-    all_repos = sorted(list(existing_repos.union(new_scanned_repos)))
-    all_users = sorted(list(existing_users.union(new_scanned_users)))
-    
-    # Batasi memori cache maksimal 10,000 riwayat (FIFO rolling)
-    if len(all_repos) > 10000:
-        all_repos = all_repos[-10000:]
-    if len(all_users) > 5000:
-        all_users = all_users[-5000:]
-
-    payload_data = json.dumps({"repos": all_repos, "users": all_users}, indent=2)
-    b64_content = base64.b64encode(payload_data.encode("utf-8")).decode("utf-8")
-    
-    headers = {
-        "Authorization": f"Bearer {GH_PAT}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "CiroScan-CacheEngine"
-    }
-    url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{CACHE_FILE}"
-    body = {
-        "message": f"chore(cache): update scanned history (+{len(new_scanned_repos)} repos)",
-        "content": b64_content,
-        "branch": CACHE_BRANCH
-    }
-    if latest_sha:
-        body["sha"] = latest_sha
-    try:
-        r = requests.put(url, headers=headers, json=body, timeout=20)
-        if r.status_code in (200, 201):
-            print(f"💾 Sukses simpan riwayat cache ke branch '{CACHE_BRANCH}'! (Total: {len(all_repos)} repo).")
-        else:
-            print(f"⚠️ Gagal update cache state ({r.status_code}): {r.text[:120]}")
-    except Exception as e:
-        print(f"⚠️ Gagal update cache branch: {e}")
-
 def collect_targets_from_dork():
     """Return (targets, dork_detail). dork_detail = info query → jml hasil."""
     queries = [q.strip() for q in DORK_QUERIES_RAW.split("|") if q.strip()] \
@@ -292,13 +214,10 @@ def collect_targets_from_dork():
 
     repo_urls = []      # urutan penemuan (dipertahankan, jangan sorted)
     seen = set()
-    
-    # Ambil riwayat repo & user yang pernah discan sebelumnya dari cache
-    history_repos, history_users, _ = _load_scanned_history()
-    seen.update(history_repos)
 
     # ASINKRON: semua query jalan PARALEL (query independen; rate limit
     # code search 30/menit, 3 query bersamaan masih jauh di bawah batas).
+    # Hasil digabung SESUAI URUTAN query (bukan urutan selesai) biar stabil.
     results_by_query = {}
     with ThreadPoolExecutor(max_workers=min(n, DORK_QUERY_WORKERS)) as ex:
         fut2q = {ex.submit(_gh_code_search, q): q for q in picked_queries}
@@ -306,10 +225,10 @@ def collect_targets_from_dork():
             results_by_query[fut2q[fut]] = fut.result()
 
     # BAGI RATA: kumpulkan kandidat per query dulu, lalu ambil GILIRAN
-    # Filter ketat: BUANG repo yang sudah ada di riwayat cache!
-    per_query_candidates = []
+    # (round-robin: 1 repo per query per putaran) — tiap query dapat jatah
+    # yang sama; kalau satu query habis duluan, sisa slot dipakai query lain.
+    per_query_candidates = []   # [(query, [full_name, ...]), ...] sesuai urutan query
     error_queries = set()
-    skipped_history_count = 0
     for query in picked_queries:
         items = results_by_query.get(query)
         if items is None:
@@ -320,18 +239,11 @@ def collect_targets_from_dork():
             if not _dork_item_useful(item):
                 continue
             full_name = (item.get("repository") or {}).get("full_name")
-            if not full_name:
+            if not full_name or full_name in seen:
                 continue
-            owner_user = full_name.split("/")[0] if "/" in full_name else ""
-            if full_name in seen or (owner_user and owner_user in history_users):
-                skipped_history_count += 1
-                continue
-            seen.add(full_name)   # dedup global
+            seen.add(full_name)   # dedup global: query awal yang menang
             cands.append(full_name)
         per_query_candidates.append((query, cands))
-    
-    if skipped_history_count > 0:
-        print(f"🛡️ Cache Filter: Berhasil memblokir {skipped_history_count} repo/user yang sudah pernah discan sebelumnya!")
 
     found_by_query = {q: 0 for q, _ in per_query_candidates}
     round_idx = 0
@@ -415,26 +327,21 @@ def _is_placeholder_uri(redacted):
 def classify_finding(data):
     """Kembalikan (bucket, reason): active / potential / noise."""
     det = data.get("DetectorName") or data.get("DetectorType") or "?"
+    verified = data.get("Verified")
+    if verified is True:
+        return "active", "Verified live oleh TruffleHog (API layanan asli dikontak)"
     meta = (data.get("SourceMetadata") or {}).get("Data") or {}
     git = meta.get("Git") or meta.get("Github") or {}
-    fpath = (git.get("file") or "").lower()
+    fpath = git.get("file") or ""
     redacted = (data.get("Redacted") or "").replace("\n", " ")
-
-    # Filter NOISE dulu (Dependency & Test fixture buang ke noise meski verified)
-    if "vendor/" in fpath or "node_modules/" in fpath:
-        return "noise", "Dependency vendor / node_modules (bukan kode sendiri)"
-    if "test/fixtures/" in fpath or "/fixtures/" in fpath or "/mock/" in fpath:
-        return "noise", "Mock / Test fixture dummy key"
     if det == "Box":
         return "noise", "Box detector false positive"
+    if "vendor/" in fpath or "node_modules/" in fpath:
+        return "noise", "Dependency vendor / node_modules (bukan kode sendiri)"
     if det == "PrivateKey" and "boringssl" in fpath:
         return "noise", "Kunci test BoringSSL"
     if det == "URI" and _is_placeholder_uri(redacted):
         return "noise", "URI contoh/placeholder (example.com, user:pass@host, domain test)"
-
-    verified = data.get("Verified")
-    if verified is True:
-        return "active", "Verified live oleh TruffleHog (API layanan asli dikontak)"
     return "potential", "Belum terverifikasi tapi bentuknya kunci asli (lama/session/kredensial)"
 
 def safe_record(data, bucket, reason):
@@ -484,13 +391,8 @@ def collect_targets_from_feed():
         print("❌ Feed kosong — tidak ada user yang bisa dipicked.")
         return [], []
 
-    # Ambil riwayat cache agar user yang sudah pernah discan tidak diulang
-    _, history_users, _ = _load_scanned_history()
-    fresh_users = [u for u in users_seen.keys() if u not in history_users]
-    if len(fresh_users) < FEED_MAX_USERS:
-        # Fallback jika kehabisan user 100% fresh
-        fresh_users = list(users_seen.keys())
-    picked_users = fresh_users[:FEED_MAX_USERS]
+    # JANGAN di-sorted: urutan dict = urutan pertama ketemu di feed (event terbaru dulu)
+    picked_users = list(users_seen.keys())[:FEED_MAX_USERS]
     print(f"🎯 {len(users_seen)} user aktif terdeteksi, dipicked {len(picked_users)} user: "
           f"{', '.join(picked_users)}")
 
@@ -503,22 +405,19 @@ def collect_targets_from_feed():
         detail_by_user[u] = entry
 
     if FEED_MAX_REPOS_PER_USER > 1:
-        # ASINKRON PARALEL: Ambil daftar repo user secara bersamaan (super cepat)
-        def _fetch_user_repos(user):
-            data = _gh_api_get(f"https://api.github.com/users/{user}/repos?per_page=100&sort=pushed&type=owner")
-            return user, data
-
-        user_repos_map = {}
-        with ThreadPoolExecutor(max_workers=min(len(picked_users), 8)) as ex:
-            fut_map = {ex.submit(_fetch_user_repos, u): u for u in picked_users}
-            for fut in as_completed(fut_map):
-                u, repos = fut.result()
-                user_repos_map[u] = repos or []
-
+        # ASINKRON (quick win): fetch daftar repo tiap user jalan PARALEL.
+        # requests.get thread-safe; ex.map menjaga urutan sesuai picked_users,
+        # jadi hasil & urutan target IDENTIK dengan versi sekuensial — cuma lebih cepat.
+        def _fetch_user_repos(u):
+            return _gh_api_get(f"https://api.github.com/users/{u}/repos?per_page=100&sort=pushed&type=owner")
+        with ThreadPoolExecutor(max_workers=min(len(picked_users), FEED_FETCH_WORKERS)) as ex:
+            fetched = dict(zip(picked_users, ex.map(_fetch_user_repos, picked_users)))
         for u in picked_users:
             if len(targets) >= FEED_MAX_TOTAL_REPOS:
                 break
-            repos = user_repos_map.get(u, [])
+            repos = fetched.get(u)
+            if not repos:
+                continue
             added = 0
             for r in repos:
                 if added >= FEED_MAX_REPOS_PER_USER - 1 or len(targets) >= FEED_MAX_TOTAL_REPOS:
@@ -651,14 +550,15 @@ def search_text_in_repo(repo_url, keyword, repo_name):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-def run_text_search(targets, keyword, target_label=""):
+def run_text_search(targets, keyword, target_label="", suffix="", quiet=False):
     """Mode -bebas: cari keyword di semua repo target, laporkan ke Telegram."""
     total_targets = len(targets)
     is_batch = total_targets > 1
-    send_telegram_text(
-        f"🔍 <b>PENCARIAN TEKS BEBAS DIMULAI!</b>\n\n🔎 <b>Kata kunci:</b> <code>{html.escape(keyword)}</code>\n"
-        f"🎯 <b>Target:</b> <code>{target_label or TARGET_INPUT}</code>\n📦 <b>Total Repositori:</b> <b>{total_targets} repo</b>\n"
-        f"⏳ <i>Sedang menyisir seluruh history commit...</i>")
+    if not quiet:
+        send_telegram_text(
+            f"🔍 <b>PENCARIAN TEKS BEBAS DIMULAI!</b>\n\n🔎 <b>Kata kunci:</b> <code>{html.escape(keyword)}</code>\n"
+            f"🎯 <b>Target:</b> <code>{target_label or TARGET_INPUT}</code>\n📦 <b>Total Repositori:</b> <b>{total_targets} repo</b>\n"
+            f"⏳ <i>Sedang menyisir seluruh history commit...</i>")
 
     all_matches = []
     failed_repos = []
@@ -678,9 +578,9 @@ def run_text_search(targets, keyword, target_label=""):
 
     all_matches = all_matches[:MAX_TOTAL_MATCHES]
     all_matches.sort(key=lambda r: (r["category"] != "potential", r["repo"], r["file"]))
-    with open("text_search_results.json", "w") as f:
+    with open(f"text_search_results{suffix}.json", "w") as f:
         json.dump(all_matches, f, indent=2, ensure_ascii=False)
-    print(f"📁 text_search_results.json: {len(all_matches)} kecocokan")
+    print(f"📁 text_search_results{suffix}.json: {len(all_matches)} kecocokan")
 
     potential = [m for m in all_matches if m["category"] == "potential"]
     noise = [m for m in all_matches if m["category"] == "noise"]
@@ -716,14 +616,17 @@ def run_text_search(targets, keyword, target_label=""):
             msg_lines.append(f"• <code>{fr['repo']}</code>: <code>{html.escape(fr['error'][:200])}</code>")
     else:
         msg_lines.append(f"\n✅ <b>TIDAK KETEMU!</b> Kata <code>{html.escape(keyword)}</code> tidak muncul di repo manapun.")
-    send_telegram_text("\n".join(msg_lines))
+    if not quiet:
+        send_telegram_text("\n".join(msg_lines))
 
-    if all_matches:
-        send_telegram_document("text_search_results.json",
+    if all_matches and not quiet:
+        send_telegram_document(f"text_search_results{suffix}.json",
                                f"🔍 Hasil pencarian '{keyword}' ({len(all_matches)} kecocokan) — {target_label or TARGET_INPUT}")
     if failed_repos:
         print(f"❌ {len(failed_repos)} repo gagal dicari, keluar dengan error.")
-        sys.exit(1)
+        if not quiet:
+            sys.exit(1)
+    return all_matches, repo_summaries, failed_repos
 
 
 def _scan_single_repo(repo_info):
@@ -782,11 +685,10 @@ def _scan_single_repo(repo_info):
         "failed": False, "error": None,
         "findings": findings, "verified_findings": verified
     }
-
-def main():
+def collect_targets():
+    """Kumpulkan target sesuai mode (dork / feed / manual). Return (targets, label, mode, feed_detail, dork_detail)."""
     feed_detail = []
     dork_detail = []   # === [DORK] ===
-
     # === [UBAH] === Prioritas cabang: DORK dulu (lebih spesifik), lalu FEED, lalu manual
     if DORK_MODE:
         print("🎣 MODE DORK GLOBAL aktif — target dicari via GitHub Code Search.")
@@ -813,18 +715,12 @@ def main():
         target_label = TARGET_INPUT
         mode_tag = "manual"
 
-    # Mode pencarian teks bebas: -bebas <keyword>
-    if SEARCH_KEYWORD:
-        run_text_search(targets, SEARCH_KEYWORD, target_label)
-        return
+    return targets, target_label, mode_tag, feed_detail, dork_detail
 
+
+def send_start_message(targets, target_label, mode_tag, feed_detail, dork_detail, is_batch):
+    """Kirim pesan Telegram DIMULAI sesuai mode (dipakai jalur lama & collect-only)."""
     total_targets = len(targets)
-
-    if total_targets == 0:
-        send_telegram_text(f"⚠️ Tidak ditemukan repositori untuk target: <code>{target_label}</code>")
-        return
-
-    is_batch = total_targets > 1
     # === [UBAH] === Pesan mulai: tambah cabang untuk mode DORK
     if mode_tag == "dork" and is_batch:
         q_list = "\n".join(f"• <code>{html.escape(d['query'])}</code> → {d['found']} repo"
@@ -853,6 +749,11 @@ def main():
     else:
         send_telegram_text(f"🔍 <b>TruffleHog Security Scan Dimulai!</b>\n\n🎯 <b>Target:</b> <code>{targets[0]}</code>\n⏳ <i>Sedang mengendus seluruh riwayat commit...</i>")
 
+
+
+def run_parallel_scan(targets, suffix=""):
+    """Scan semua target paralel, tulis findings_{bucket}{suffix}.json. Return dict hasil."""
+    total_targets = len(targets)
     all_findings = []
     verified_findings = []
     repo_summaries = []
@@ -895,12 +796,25 @@ def main():
         buckets[bucket].append(rec)
     for bucket, rows in buckets.items():
         rows.sort(key=lambda r: (r["detector"], r["repo"], r["file"]))
-        with open(f"findings_{bucket}.json", "w") as f:
+        with open(f"findings_{bucket}{suffix}.json", "w") as f:
             json.dump(rows, f, indent=2, ensure_ascii=False)
-        print(f"📁 findings_{bucket}.json: {len(rows)} temuan")
+        print(f"📁 findings_{bucket}{suffix}.json: {len(rows)} temuan")
 
     total_verified = len(verified_findings)
     total_leaks = len(all_findings)
+
+    return {
+        "repo_summaries": repo_summaries,
+        "failed_repos": failed_repos,
+        "buckets": buckets,
+        "total_verified": total_verified,
+        "total_leaks": total_leaks,
+    }
+
+
+def send_scan_report(target_label, mode_tag, total_targets, repo_summaries, failed_repos,
+                   buckets, total_verified, total_leaks, feed_detail, dork_detail, is_batch):
+    """Bangun + kirim laporan Telegram (teks + file). Dipakai jalur lama & merge-only."""
     total_active = len(buckets["active"])
     total_potential = len(buckets["potential"])
     total_noise = len(buckets["noise"])
@@ -962,16 +876,228 @@ def main():
     if total_potential > 0:
         send_telegram_document("findings_potential.json", f"⚠️ File JSON Temuan POTENSIAL ({total_potential}) — {report_target_label}")
 
-    # Simpan repo & user yang baru discan ke riwayat cache di branch 'state'
-    try:
-        new_repos_to_cache = {s.get("repo") for s in repo_summaries if s.get("repo")}
-        new_users_to_cache = {r.split("/")[0] for r in new_repos_to_cache if "/" in r}
-        _save_scanned_history(new_repos_to_cache, new_users_to_cache)
-    except Exception as ce:
-        print(f"⚠️ Gagal simpan riwayat cache: {ce}")
-
     if failed_repos:
         print(f"❌ {len(failed_repos)} repo gagal discan, keluar dengan error.")
+        return 1
+    return 0
+
+
+
+# === [SHARD] === Mode workflow matrix (4 shard) ============================
+def _load_targets_file():
+    """Baca targets.json hasil job collect."""
+    with open(TARGETS_FILE) as f:
+        return json.load(f)
+
+def _mode_collect_only():
+    """Job collect: kumpulkan target, kirim pesan DIMULAI, tulis targets.json."""
+    targets, target_label, mode_tag, feed_detail, dork_detail = collect_targets()
+    total_targets = len(targets)
+    if total_targets == 0:
+        send_telegram_text(f"⚠️ Tidak ditemukan repositori untuk target: <code>{target_label}</code>")
+        sys.exit(1)
+    is_batch = total_targets > 1
+    if SEARCH_KEYWORD:
+        send_telegram_text(
+            f"🔍 <b>PENCARIAN TEKS BEBAS DIMULAI!</b>\n\n🔎 <b>Kata kunci:</b> <code>{html.escape(SEARCH_KEYWORD)}</code>\n"
+            f"🎯 <b>Target:</b> <code>{target_label}</code>\n📦 <b>Total Repositori:</b> <b>{total_targets} repo</b>\n"
+            f"⏳ <i>Sedang menyisir seluruh history commit...</i>")
+    else:
+        send_start_message(targets, target_label, mode_tag, feed_detail, dork_detail, is_batch)
+    data = {
+        "targets": targets,
+        "target_label": target_label,
+        "mode_tag": mode_tag,
+        "feed_detail": feed_detail,
+        "dork_detail": dork_detail,
+        "search_keyword": SEARCH_KEYWORD,
+    }
+    with open("targets.json", "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"📁 targets.json: {total_targets} repo target (mode {mode_tag})")
+
+def _mode_shard_scan():
+    """Job scan matrix: scan hanya shard ke-SHARD_INDEX (round-robin), tulis file shard."""
+    data = _load_targets_file()
+    targets_all = data["targets"]
+    target_label = data.get("target_label", "")
+    shard_targets = targets_all[SHARD_INDEX::SHARD_TOTAL]
+    suffix = f"_shard{SHARD_INDEX}"
+    print(f"🧩 SHARD {SHARD_INDEX}/{SHARD_TOTAL}: {len(shard_targets)} dari {len(targets_all)} repo")
+    keyword = data.get("search_keyword") or ""
+    if keyword:
+        all_matches, repo_summaries, failed_repos = run_text_search(
+            shard_targets, keyword, target_label, suffix=suffix, quiet=True)
+        summary = {"shard": SHARD_INDEX, "shard_total": SHARD_TOTAL, "mode": "search",
+                   "keyword": keyword, "target_label": target_label,
+                   "total_targets": len(shard_targets), "total_matches": len(all_matches),
+                   "repo_summaries": repo_summaries, "failed_repos": failed_repos}
+    else:
+        res = run_parallel_scan(shard_targets, suffix=suffix)
+        summary = {"shard": SHARD_INDEX, "shard_total": SHARD_TOTAL, "mode": "scan",
+                   "target_label": target_label,
+                   "total_targets": len(shard_targets),
+                   "total_verified": res["total_verified"], "total_leaks": res["total_leaks"],
+                   "repo_summaries": res["repo_summaries"], "failed_repos": res["failed_repos"]}
+    with open(f"scan_summary{suffix}.json", "w") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"📁 scan_summary{suffix}.json: {len(summary['failed_repos'])} gagal")
+    if summary["failed_repos"]:
+        sys.exit(1)
+
+def _mode_merge_only():
+    """Job report: gabung semua shard, kirim SATU laporan Telegram, tulis file gabungan."""
+    data = _load_targets_file()
+    target_label = data.get("target_label", "")
+    mode_tag = data.get("mode_tag", "")
+    keyword = data.get("search_keyword") or ""
+    total_targets = len(data["targets"])
+    is_batch = total_targets > 1
+    summaries, failed_all, repo_all = [], [], []
+    if keyword:
+        merged, seen_keys = [], set()
+        for n in range(SHARD_TOTAL):
+            p = f"text_search_results_shard{n}.json"
+            if not os.path.exists(p):
+                print(f"⚠️ File shard hilang: {p} (job shard {n} mungkin gagal total)")
+                continue
+            with open(p) as f:
+                rows = json.load(f)
+            for r in rows:
+                key = (r.get("repo"), r.get("file"), str(r.get("line")), (r.get("content") or "")[:80])
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                merged.append(r)
+            s = json.load(open(f"scan_summary_shard{n}.json")) if os.path.exists(f"scan_summary_shard{n}.json") else None
+            if s:
+                summaries.append(s)
+                failed_all.extend(s.get("failed_repos", []))
+                repo_all.extend(s.get("repo_summaries", []))
+        merged.sort(key=lambda r: (r.get("category") != "potential", r.get("repo", ""), r.get("file", "")))
+        merged = merged[:MAX_TOTAL_MATCHES]
+        with open("text_search_results.json", "w") as f:
+            json.dump(merged, f, indent=2, ensure_ascii=False)
+        potential = [m for m in merged if m.get("category") == "potential"]
+        noise = [m for m in merged if m.get("category") == "noise"]
+        msg_lines = [
+            "🔍 <b>HASIL PENCARIAN TEKS BEBAS</b>",
+            "━━━━━━━━━━━━━━━━━━",
+            f"🔎 <b>Kata kunci:</b> <code>{html.escape(keyword)}</code>",
+            f"🎯 <b>Target:</b> <code>{target_label}</code>",
+            f"📦 <b>Repo Dicari:</b> <b>{total_targets} repositori</b>",
+            f"✅ <b>Kecocokan di kode sendiri:</b> <b>{len(potential)}</b>",
+            f"🗑️ <b>Kecocokan di vendor/noise:</b> {len(noise)}",
+            "━━━━━━━━━━━━━━━━━━",
+        ]
+        if is_batch:
+            msg_lines.append("\n📋 <b>PER REPO:</b>")
+            for s in sorted(repo_all, key=lambda x: x.get("repo", "")):
+                if s.get("failed"):
+                    msg_lines.append(f"⚠️ <code>{s['repo']}</code> : <b>SEARCH GAGAL</b>")
+                else:
+                    msg_lines.append(f"• <code>{s['repo']}</code> : <b>{s['matches']} kecocokan</b>")
+        if potential:
+            msg_lines.append("\n📌 <b>KECOCOKAN (kode sendiri):</b>")
+            for m in potential[:15]:
+                msg_lines.append(
+                    f"{m['repo']} <code>{m['file']}:{m['line']}</code> ({m['commit']})\n"
+                    f"   👉 <code>{html.escape(m['content'][:120])}</code>")
+            if len(potential) > 15:
+                msg_lines.append(f"<i>...dan {len(potential) - 15} kecocokan lainnya ada di file JSON terlampir.</i>")
+        elif failed_all:
+            msg_lines.append("\n⚠️ <b>STATUS: PENCARIAN TIDAK LENGKAP!</b> Ada repo yang gagal dicari.")
+            for fr in failed_all:
+                msg_lines.append(f"• <code>{fr['repo']}</code>: <code>{html.escape(fr['error'][:200])}</code>")
+        else:
+            msg_lines.append(f"\n✅ <b>TIDAK KETEMU!</b> Kata <code>{html.escape(keyword)}</code> tidak muncul di repo manapun.")
+        send_telegram_text("\n".join(msg_lines))
+        if merged:
+            send_telegram_document("text_search_results.json",
+                                   f"🔍 Hasil pencarian '{keyword}' ({len(merged)} kecocokan) — {target_label}")
+        if failed_all:
+            print(f"❌ {len(failed_all)} repo gagal dicari, keluar dengan error.")
+            sys.exit(1)
+        return
+    # --- mode scan biasa: gabung findings per bucket + summary ---
+    buckets = {"active": [], "potential": [], "noise": []}
+    seen_split = set()
+    total_verified = 0
+    total_leaks = 0
+    for n in range(SHARD_TOTAL):
+        sp = f"scan_summary_shard{n}.json"
+        if not os.path.exists(sp):
+            print(f"⚠️ File shard hilang: {sp} (job shard {n} mungkin gagal total)")
+            continue
+        s = json.load(open(sp))
+        summaries.append(s)
+        failed_all.extend(s.get("failed_repos", []))
+        repo_all.extend(s.get("repo_summaries", []))
+        total_verified += s.get("total_verified", 0)
+        total_leaks += s.get("total_leaks", 0)
+        for bucket in buckets:
+            p = f"findings_{bucket}_shard{n}.json"
+            if not os.path.exists(p):
+                continue
+            with open(p) as f:
+                rows = json.load(f)
+            for rec in rows:
+                key = (rec.get("detector"), str(rec.get("verified")), rec.get("redacted"),
+                       rec.get("repo"), rec.get("file"), str(rec.get("line")), rec.get("commit"))
+                if key in seen_split:
+                    continue
+                seen_split.add(key)
+                buckets[bucket].append(rec)
+    repo_all.sort(key=lambda s: s.get("idx", 0))
+    failed_all.sort(key=lambda s: s.get("idx", 0))
+    for bucket, rows in buckets.items():
+        rows.sort(key=lambda r: (r.get("detector", ""), r.get("repo", ""), r.get("file", "")))
+        with open(f"findings_{bucket}.json", "w") as f:
+            json.dump(rows, f, indent=2, ensure_ascii=False)
+        print(f"📁 findings_{bucket}.json: {len(rows)} temuan")
+    feed_detail = data.get("feed_detail", [])
+    dork_detail = data.get("dork_detail", [])
+    rc = send_scan_report(target_label, mode_tag, total_targets, repo_all, failed_all,
+                          buckets, total_verified, total_leaks, feed_detail, dork_detail, is_batch)
+    if rc:
+        sys.exit(1)
+
+
+def main():
+    # === [SHARD] === Mode workflow matrix (collect / shard / merge)
+    if COLLECT_ONLY:
+        _mode_collect_only()
+        return
+    if MERGE_ONLY:
+        _mode_merge_only()
+        return
+    if SHARD_INDEX >= 0:
+        _mode_shard_scan()
+        return
+
+    # --- Jalur lama (single-job): kumpul + scan + lapor sekaligus ---
+    targets, target_label, mode_tag, feed_detail, dork_detail = collect_targets()
+
+    # Mode pencarian teks bebas: -bebas <keyword>
+    if SEARCH_KEYWORD:
+        run_text_search(targets, SEARCH_KEYWORD, target_label)
+        return
+
+    total_targets = len(targets)
+
+    if total_targets == 0:
+        send_telegram_text(f"⚠️ Tidak ditemukan repositori untuk target: <code>{target_label}</code>")
+        return
+
+    is_batch = total_targets > 1
+    send_start_message(targets, target_label, mode_tag, feed_detail, dork_detail, is_batch)
+
+    res = run_parallel_scan(targets)
+    rc = send_scan_report(target_label, mode_tag, total_targets,
+                          res["repo_summaries"], res["failed_repos"], res["buckets"],
+                          res["total_verified"], res["total_leaks"],
+                          feed_detail, dork_detail, is_batch)
+    if rc:
         sys.exit(1)
 
 if __name__ == "__main__":
