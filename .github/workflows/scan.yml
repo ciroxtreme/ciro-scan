@@ -2,12 +2,11 @@ name: TruffleHog Security Scanner
 
 on:
   schedule:
-    # Scan santai feed global otomatis tiap 6 jam
     - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
       target_url:
-        description: "URL target repo Git / username / kata "feed" untuk scan feed global"
+        description: "URL target repo Git / username / kata feed untuk scan feed global"
         required: true
         default: "feed"
       search_keyword:
@@ -40,7 +39,7 @@ jobs:
 
       - name: Execute Security Scan & Telegram Dispatch
         env:
-          TARGET_URL: ${{ github.event.inputs.target_url || (github.event_name == 'schedule' && 'feed' || 'feed') }}
+          TARGET_URL: ${{ github.event.inputs.target_url || 'feed' }}
           SEARCH_KEYWORD: ${{ github.event.inputs.search_keyword || '' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
