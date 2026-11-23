@@ -1,7 +1,10 @@
 *.json
+!package.json
 *.txt
 !requirements.txt
 __pycache__/
 .env
 bin/
 *.zip
+node_modules/
+package-lock.json

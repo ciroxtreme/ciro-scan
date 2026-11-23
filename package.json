@@ -1,0 +1,18 @@
+{
+  "name": "ciro-scan-bot",
+  "version": "1.0.0",
+  "description": "Adaptive Security Scanner & Codebase Audit Pipeline Telegram Bot for Pterodactyl",
+  "main": "startup.js",
+  "scripts": {
+    "start": "node startup.js"
+  },
+  "keywords": [
+    "telegram-bot",
+    "security-scanner",
+    "trufflehog",
+    "pterodactyl"
+  ],
+  "author": "ciroxtreme",
+  "license": "MIT",
+  "dependencies": {}
+}
