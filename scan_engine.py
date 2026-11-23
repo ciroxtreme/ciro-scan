@@ -10,7 +10,79 @@ import tempfile
 import html
 import urllib.request
 import urllib.parse
-import requests
+try:
+    import requests
+except ImportError:
+    import urllib.request as _url_req
+    import urllib.parse as _url_parse
+    import urllib.error as _url_err
+    import json as _json
+
+    class _ResponseShim:
+        def __init__(self, code, content):
+            self.status_code = code
+            self.content = content
+            self.text = content.decode("utf-8", errors="replace")
+        def json(self):
+            return _json.loads(self.text)
+
+    class _RequestsShim:
+        @staticmethod
+        def get(url, headers=None, timeout=30, **kwargs):
+            req = _url_req.Request(url, headers=headers or {})
+            try:
+                with _url_req.urlopen(req, timeout=timeout) as resp:
+                    return _ResponseShim(resp.getcode(), resp.read())
+            except _url_err.HTTPError as e:
+                return _ResponseShim(e.code, e.read())
+
+        @staticmethod
+        def post(url, data=None, json=None, headers=None, files=None, timeout=30, **kwargs):
+            hdrs = dict(headers or {})
+            body = None
+            if json is not None:
+                body = _json.dumps(json).encode("utf-8")
+                hdrs["Content-Type"] = "application/json"
+            elif files is not None:
+                boundary = "----WebKitFormBoundary" + hex(int(time.time() * 1000))[2:]
+                hdrs["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+                lines = []
+                if data:
+                    for k, v in data.items():
+                        lines.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8"))
+                for k, fobj in files.items():
+                    fname = os.path.basename(getattr(fobj, "name", "file"))
+                    fcontent = fobj.read() if hasattr(fobj, "read") else fobj
+                    lines.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{fname}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode("utf-8"))
+                    lines.append(fcontent + b"\r\n")
+                lines.append(f"--{boundary}--\r\n".encode("utf-8"))
+                body = b"".join(lines)
+            elif data is not None:
+                body = _url_parse.urlencode(data).encode("utf-8")
+                hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+
+            req = _url_req.Request(url, data=body, headers=hdrs, method="POST")
+            try:
+                with _url_req.urlopen(req, timeout=timeout) as resp:
+                    return _ResponseShim(resp.getcode(), resp.read())
+            except _url_err.HTTPError as e:
+                return _ResponseShim(e.code, e.read())
+
+        @staticmethod
+        def put(url, data=None, json=None, headers=None, timeout=30, **kwargs):
+            hdrs = dict(headers or {})
+            body = None
+            if json is not None:
+                body = _json.dumps(json).encode("utf-8")
+                hdrs["Content-Type"] = "application/json"
+            req = _url_req.Request(url, data=body, headers=hdrs, method="PUT")
+            try:
+                with _url_req.urlopen(req, timeout=timeout) as resp:
+                    return _ResponseShim(resp.getcode(), resp.read())
+            except _url_err.HTTPError as e:
+                return _ResponseShim(e.code, e.read())
+
+    requests = _RequestsShim()
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TARGET_INPUT = sys.argv[1] if len(sys.argv) > 1 else os.getenv("TARGET_URL", "")

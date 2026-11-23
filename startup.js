@@ -66,34 +66,33 @@ function ensureTruffleHog() {
 
   if (!hasTh) {
     console.log('📥 Mengunduh biner resmi TruffleHog ke ./bin/trufflehog...');
+    const arch = (process.arch === 'arm64' || process.arch === 'aarch64') ? 'arm64' : 'amd64';
+    const tag = 'v3.100.1';
+    const ver = '3.100.1';
+    const tarName = `trufflehog_${ver}_linux_${arch}.tar.gz`;
+    const tarUrl = `https://github.com/trufflesecurity/trufflehog/releases/download/${tag}/${tarName}`;
+    const tmpTar = path.join('/tmp', 'th.tar.gz');
+
     try {
-      execSync('curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b ./bin', {
+      execSync(`curl -sL "${tarUrl}" -o "${tmpTar}" && tar -xzf "${tmpTar}" -C "${BIN_DIR}" trufflehog && rm -f "${tmpTar}" && chmod +x "${localTh}"`, {
         stdio: 'inherit',
       });
       console.log('✅ TruffleHog berhasil dipasang di ./bin/trufflehog\n');
     } catch (e) {
-      console.warn('⚠️ Gagal unduh otomatis via curl script:', e.message);
+      console.warn('⚠️ Gagal unduh langsung tarball TruffleHog:', e.message);
     }
   } else {
     console.log('✅ TruffleHog siap digunakan.\n');
   }
 }
 
-// 4. Verifikasi dependensi Python (requests)
+// 4. Verifikasi runtime Python 3
 function ensurePythonDeps() {
   try {
-    execSync('python3 -c "import requests"', { stdio: 'ignore' });
-    console.log('✅ Modul Python (requests) siap.\n');
+    const ver = execSync('python3 --version', { encoding: 'utf8' }).trim();
+    console.log(`✅ Runtime ${ver} terdeteksi.\n`);
   } catch (e) {
-    console.log('📦 Memasang modul Python "requests"...');
-    try {
-      execSync('pip3 install requests --no-cache-dir || pip install requests --no-cache-dir', {
-        stdio: 'inherit',
-      });
-      console.log('✅ Modul Python berhasil dipasang.\n');
-    } catch (err) {
-      console.warn('⚠️ Peringatan saat pip install:', err.message);
-    }
+    console.warn('⚠️ Python3 tidak ditemukan di sistem. Pastikan container mendukung python3.\n');
   }
 }
 
