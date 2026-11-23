@@ -2,11 +2,20 @@
 /**
  * startup.js — Entrypoint & Telegram Bot Daemon ciro-scan untuk Pterodactyl VPS (Node.js Egg)
  * Mendukung standar: npm install && npm start (atau node startup.js)
+ *
+ * Fitur Utama:
+ * 1. Zero external npm dependencies — Native HTTPS & Node.js Crypto.
+ * 2. In-Memory Vault: GitHub PAT disimpan terenkripsi AES-256-GCM di secrets.enc,
+ *    hanya didekripsi ke RAM dan di-inject ke memory child process saat scan.
+ * 3. Multi-PAT Auto-Rolling: Mendukung fallback otomatis jika salah satu token kena limit.
+ * 4. Auto-Scan 24/7 Loop: Pemindaian terus menerus tanpa henti dengan configurable interval.
+ * 5. Task Queue FIFO: Mencegah tabrakan pemindaian bersamaan.
  */
 
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const crypto = require('crypto');
 const { spawn, execSync } = require('child_process');
 
 console.log('====================================================');
@@ -53,7 +62,7 @@ const BIN_DIR = path.join(__dirname, 'bin');
 if (!fs.existsSync(BIN_DIR)) fs.mkdirSync(BIN_DIR, { recursive: true });
 process.env.PATH = `${BIN_DIR}:${process.env.PATH || ''}`;
 
-// 3. Verifikasi & Unduh TruffleHog jika belum ada
+// 3. Verifikasi & Pasang TruffleHog jika belum ada
 function ensureTruffleHog() {
   const localTh = path.join(BIN_DIR, 'trufflehog');
   let hasTh = false;
@@ -99,7 +108,82 @@ function ensurePythonDeps() {
 ensureTruffleHog();
 ensurePythonDeps();
 
-// 5. Telegram API Client (Native HTTPS, Zero Dependency)
+// ============================================================================
+// 5. In-Memory Vault (AES-256-GCM + scrypt) — Zero Plaintext PAT on Disk
+// ============================================================================
+const VAULT_FILE = path.join(__dirname, 'secrets.enc');
+const VAULT_KEY = (process.env.VAULT_KEY || 'ciro_scan_vault_key_2026_aes_gcm').trim();
+let inMemoryPats = [];
+
+function encryptVault(dataObj, masterKey) {
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+  const key = crypto.scryptSync(masterKey, salt, 32);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  let enc = cipher.update(JSON.stringify(dataObj), 'utf8', 'hex');
+  enc += cipher.final('hex');
+  const tag = cipher.getAuthTag();
+  return {
+    salt: salt.toString('hex'),
+    iv: iv.toString('hex'),
+    tag: tag.toString('hex'),
+    data: enc,
+  };
+}
+
+function decryptVault(vaultObj, masterKey) {
+  const salt = Buffer.from(vaultObj.salt, 'hex');
+  const iv = Buffer.from(vaultObj.iv, 'hex');
+  const tag = Buffer.from(vaultObj.tag, 'hex');
+  const key = crypto.scryptSync(masterKey, salt, 32);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  let dec = decipher.update(vaultObj.data, 'hex', 'utf8');
+  dec += decipher.final('utf8');
+  return JSON.parse(dec);
+}
+
+function loadVault() {
+  if (fs.existsSync(VAULT_FILE)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
+      const decrypted = decryptVault(raw, VAULT_KEY);
+      if (decrypted && Array.isArray(decrypted.pats)) {
+        inMemoryPats = decrypted.pats.filter(p => typeof p === 'string' && p.trim().length > 0);
+        console.log(`🔐 [Vault] Berhasil mendekripsi & memuat ${inMemoryPats.length} GitHub PAT ke RAM.`);
+      }
+    } catch (e) {
+      console.warn('⚠️ [Vault] Gagal membaca/mendekripsi secrets.enc:', e.message);
+    }
+  }
+
+  // Fallback membaca environment jika vault belum ada
+  if (inMemoryPats.length === 0) {
+    const envPats = [];
+    if (process.env.GH_PAT) envPats.push(...process.env.GH_PAT.split(','));
+    for (const k of ['GH_PAT_1', 'GH_PAT_2', 'GH_PAT_3']) {
+      if (process.env[k]) envPats.push(process.env[k]);
+    }
+    inMemoryPats = Array.from(new Set(envPats.map(p => p.trim()).filter(Boolean)));
+    if (inMemoryPats.length > 0) {
+      console.log(`🔑 [Vault] Memuat ${inMemoryPats.length} PAT dari environment server ke RAM.`);
+    }
+  }
+}
+
+function saveVault(pats) {
+  inMemoryPats = pats.filter(p => typeof p === 'string' && p.trim().length > 0);
+  const encrypted = encryptVault({ pats: inMemoryPats }, VAULT_KEY);
+  fs.writeFileSync(VAULT_FILE, JSON.stringify(encrypted, null, 2), 'utf8');
+  console.log(`💾 [Vault] Berhasil menyimpan terenkripsi ke secrets.enc (${inMemoryPats.length} token di RAM).`);
+}
+
+// Inisialisasi Vault saat boot
+loadVault();
+
+// ============================================================================
+// 6. Telegram API Client (Native HTTPS, Zero External Dependency)
+// ============================================================================
 function telegramRequest(method, payload) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(payload || {});
@@ -149,6 +233,9 @@ async function sendMessage(chatId, text, options = {}) {
 }
 
 function getHelpText() {
+  const patCount = inMemoryPats.length;
+  const rateLimitStr = patCount > 0 ? `${patCount * 5000} req/jam` : '60 req/jam (anonim)';
+
   return [
     '🐷🔍 <b>CIRO-SCAN TELEGRAM BOT (Pterodactyl Node.js)</b>',
     '────────────────────────────',
@@ -175,14 +262,20 @@ function getHelpText() {
     '• <code>/auto feed</code> — Set mode feed publik',
     '• <code>/auto dork</code> — Set mode dork code search',
     '• <code>/auto 60</code> — Ubah jeda jeda antar ronde (detik)\n',
+    '🔐 <b>7. Manajemen GitHub PAT (In-Memory RAM):</b>',
+    `• <code>/pats</code> — Cek status & rolling token (${patCount} aktif, ${rateLimitStr})`,
+    '• <code>/set_pat token1 token2 ...</code> — Simpan PAT terenkripsi AES-256-GCM',
+    '• <code>/clear_pat</code> — Hapus seluruh PAT dari RAM & disk\n',
     '<b>Perintah Kontrol:</b>',
-    '• <code>/status</code> — Cek status pemindaian & antrean',
+    '• <code>/status</code> — Cek status pemindaian, auto-scan & antrean',
     '• <code>/stop</code> — Batalkan proses yang sedang berjalan',
     '• <code>/help</code> — Buka panduan ini kembali',
   ].join('\n');
 }
 
-// 6. Sistem Antrean (Task Queue FIFO) & Eksekusi Proses
+// ============================================================================
+// 7. Sistem Antrean (Task Queue FIFO) & Eksekusi Proses
+// ============================================================================
 const taskQueue = [];
 let isBusy = false;
 let currentProcess = null;
@@ -234,12 +327,20 @@ function processNextTask() {
 
   console.log(`\n🚀 [TASK] Memulai scan target: ${currentTargetLabel}`);
 
+  // Suntikkan environment variabel, termasuk token PAT murni dari RAM ke memory child process
   const env = Object.assign({}, process.env, {
     TARGET_URL: targetInput,
     TELEGRAM_BOT_TOKEN: BOT_TOKEN,
     TELEGRAM_CHAT_ID: ALLOWED_CHAT_ID,
     PATH: `${BIN_DIR}:${process.env.PATH || ''}`,
   });
+
+  if (inMemoryPats.length > 0) {
+    env.GH_PAT = inMemoryPats.join(',');
+    inMemoryPats.forEach((pat, idx) => {
+      env[`GH_PAT_${idx + 1}`] = pat;
+    });
+  }
 
   if (searchKw) env.SEARCH_KEYWORD = searchKw;
   else delete env.SEARCH_KEYWORD;
@@ -284,6 +385,9 @@ function processNextTask() {
   }
 }
 
+// ============================================================================
+// 8. Handler Pesan Masuk
+// ============================================================================
 function handleIncomingMessage(msg) {
   const chatId = String((msg.chat && msg.chat.id) || '');
   const text = (msg.text || '').trim();
@@ -299,11 +403,72 @@ function handleIncomingMessage(msg) {
   console.log(`📩 Pesan dari Tuan Ciro: "${text}"`);
   const lower = text.toLowerCase();
 
+  // Menu Help
   if (lower === '/start' || lower === '/help' || lower === 'help' || lower === 'menu') {
     sendMessage(chatId, getHelpText());
     return;
   }
 
+  // Token Vault Commands
+  if (lower === '/pats' || lower === '/tokens' || lower === '/token') {
+    if (inMemoryPats.length === 0) {
+      sendMessage(chatId, [
+        '🔐 <b>Status GitHub PAT di RAM:</b>',
+        '⚠️ <i>Belum ada token GitHub PAT yang tersimpan di RAM.</i>',
+        '',
+        'Gunakan perintah <code>/set_pat &lt;token1&gt; &lt;token2&gt; &lt;token3&gt;</code> untuk menyimpan token secara aman ke RAM (dienkripsi ke secrets.enc).',
+      ].join('\n'));
+      return;
+    }
+    const lines = [
+      '🔐 <b>Status GitHub PAT di RAM (Terenkripsi AES-256-GCM di Disk):</b>',
+      '────────────────────────────',
+      `📊 <b>Total Token:</b> ${inMemoryPats.length} PAT aktif`,
+      `⚡ <b>Kapasitas Rate Limit Gabungan:</b> ${inMemoryPats.length * 5000} req/jam`,
+      `🔄 <b>Mode Rolling / Fallback:</b> Otomatis rotasi jika token kena 403 / 429`,
+      '',
+    ];
+    inMemoryPats.forEach((p, i) => {
+      const masked = p.length > 10 ? `${p.slice(0, 7)}...${p.slice(-4)}` : '***';
+      lines.push(`• PAT #${i + 1}: <code>${masked}</code> (Siap di RAM)`);
+    });
+    lines.push('');
+    lines.push('💡 <i>Token tersimpan terenkripsi penuh di secrets.enc dan hanya berada di RAM saat bot berjalan.</i>');
+    sendMessage(chatId, lines.join('\n'));
+    return;
+  }
+
+  if (lower.startsWith('/set_pat') || lower.startsWith('/setpat')) {
+    const rawArgs = text.replace(/^\/(set_pat|setpat)/i, '').trim();
+    const newTokens = rawArgs.split(/[\s,]+/).map(t => t.trim()).filter(t => t.startsWith('ghp_') || t.startsWith('github_pat_'));
+    if (newTokens.length === 0) {
+      sendMessage(chatId, [
+        '⚠️ <b>Format Token Tidak Valid!</b>',
+        'Kirim token GitHub PAT yang valid (diawali <code>ghp_</code> atau <code>github_pat_</code>):',
+        '👉 <code>/set_pat ghp_token1 ghp_token2 ghp_token3</code>',
+      ].join('\n'));
+      return;
+    }
+    saveVault(newTokens);
+    sendMessage(chatId, [
+      '✅ <b>Berhasil Menyimpan PAT Baru!</b>',
+      `🔒 <b>Jumlah Token di RAM:</b> ${inMemoryPats.length} PAT`,
+      `⚡ <b>Total Kapasitas:</b> ${inMemoryPats.length * 5000} req/jam`,
+      '🛡️ <i>Token langsung dienkripsi AES-256-GCM ke secrets.enc dan disiagakan di RAM.</i>',
+    ].join('\n'));
+    return;
+  }
+
+  if (lower === '/clear_pat' || lower === '/clearpat') {
+    inMemoryPats = [];
+    if (fs.existsSync(VAULT_FILE)) {
+      try { fs.unlinkSync(VAULT_FILE); } catch (e) {}
+    }
+    sendMessage(chatId, '🗑️ <b>Semua GitHub PAT telah dihapus dari RAM dan berkas secrets.enc.</b>');
+    return;
+  }
+
+  // Auto-Scan Commands
   if (lower.startsWith('/auto') || lower.startsWith('/loop')) {
     const parts = text.split(/\s+/);
     const sub = parts[1] ? parts[1].toLowerCase() : '';
@@ -316,9 +481,10 @@ function handleIncomingMessage(msg) {
     if (sub === 'on' || sub === 'start' || !sub) {
       autoScanEnabled = true;
       sendMessage(chatId, [
-        '🔄 <b>Auto-Scan Diaktifkan!</b>',
+        '🔄 <b>Auto-Scan 24/7 Diaktifkan!</b>',
         `🎯 Mode: <code>${autoScanMode}</code>`,
         `⏱️ Jeda Antar Ronde: <code>${autoScanInterval}s</code>`,
+        `🔐 Multi-PAT: <code>${inMemoryPats.length} token aktif</code> (${inMemoryPats.length * 5000} req/jam)`,
         '',
         '<i>Bot akan memindai secara terus-menerus 24/7 tanpa henti. Ketik <code>/auto off</code> untuk mematikan.</i>',
       ].join('\n'));
@@ -330,7 +496,7 @@ function handleIncomingMessage(msg) {
     if (sub === 'feed' || sub === 'dork') {
       autoScanMode = sub;
       autoScanEnabled = true;
-      sendMessage(chatId, `🔄 <b>Auto-Scan diset ke mode:</b> <code>${autoScanMode}</code> (Aktif)`);
+      sendMessage(chatId, `🔄 <b>Auto-Scan diset ke mode:</b> <code>${autoScanMode}</code> (Aktif 24/7)`);
       if (!isBusy && taskQueue.length === 0) {
         scheduleNextAutoScan();
       }
@@ -344,7 +510,7 @@ function handleIncomingMessage(msg) {
     }
     sendMessage(chatId, [
       'ℹ️ <b>Format Perintah Auto-Scan:</b>',
-      '• <code>/auto on</code> — Nyalakan auto-scan terus-menerus (mode feed)',
+      '• <code>/auto on</code> — Nyalakan auto-scan terus-menerus (24/7)',
       '• <code>/auto off</code> — Matikan auto-scan',
       '• <code>/auto feed</code> — Set auto-scan mode feed publik',
       '• <code>/auto dork</code> — Set auto-scan mode dork code search',
@@ -353,10 +519,15 @@ function handleIncomingMessage(msg) {
     return;
   }
 
+  // Status
   if (lower === '/status') {
     const autoStatus = autoScanEnabled
       ? `AKTIF (mode: <code>${autoScanMode}</code>, tiap <code>${autoScanInterval}s</code>)`
       : 'NONAKTIF';
+
+    const patStatus = inMemoryPats.length > 0
+      ? `${inMemoryPats.length} token di RAM (${inMemoryPats.length * 5000} req/jam)`
+      : 'Anonim (0 token di RAM)';
 
     if (isBusy && currentTargetLabel) {
       const dur = Math.round((Date.now() - taskStartTime) / 1000);
@@ -367,6 +538,7 @@ function handleIncomingMessage(msg) {
         `⏱️ <b>Durasi:</b> ${dur} detik`,
         `📦 <b>Antrean Menunggu:</b> ${taskQueue.length} tugas`,
         `🔁 <b>Auto-Scan (24/7):</b> ${autoStatus}`,
+        `🔐 <b>GitHub PAT di RAM:</b> ${patStatus}`,
       ].join('\n'));
     } else {
       sendMessage(chatId, [
@@ -375,11 +547,13 @@ function handleIncomingMessage(msg) {
         '✨ <b>Status:</b> IDLE (Siaga menerima target baru)',
         `📦 <b>Antrean Menunggu:</b> ${taskQueue.length} tugas`,
         `🔁 <b>Auto-Scan (24/7):</b> ${autoStatus}`,
+        `🔐 <b>GitHub PAT di RAM:</b> ${patStatus}`,
       ].join('\n'));
     }
     return;
   }
 
+  // Stop / Cancel Current Task
   if (lower === '/stop') {
     if (autoScanEnabled) {
       autoScanEnabled = false;
@@ -441,13 +615,21 @@ function handleIncomingMessage(msg) {
   }
 }
 
-// 7. Loop Polling Telegram
+// ============================================================================
+// 9. Loop Polling Telegram
+// ============================================================================
 async function startBot() {
   try {
     const me = await telegramRequest('getMe');
     if (me && me.ok) {
       console.log(`✅ Bot Telegram Online: @${me.result.username}`);
-      sendMessage(ALLOWED_CHAT_ID, `🚀 <b>Ciro-Scan Bot Online!</b> (@${me.result.username})\n<i>Siaga menerima target di Pterodactyl Node.js VPS. Ketik /help untuk panduan.</i>`);
+      sendMessage(ALLOWED_CHAT_ID, [
+        `🚀 <b>Ciro-Scan Bot Online!</b> (@${me.result.username})`,
+        `🔐 <b>RAM Vault:</b> ${inMemoryPats.length} GitHub PAT aktif (${inMemoryPats.length * 5000} req/jam)`,
+        `🔁 <b>Auto-Scan:</b> ${autoScanEnabled ? 'AKTIF (24/7)' : 'Siaga (ketik /auto on)'}`,
+        '',
+        '<i>Siaga menerima target di Pterodactyl Node.js VPS. Ketik /help untuk daftar perintah.</i>',
+      ].join('\n'));
     } else {
       console.warn('⚠️ getMe response:', me);
     }
@@ -462,6 +644,11 @@ async function startBot() {
 
   let offset = null;
   console.log('👂 Menunggu pesan masuk dari Telegram (Long Polling)...');
+
+  // Jika autoScanEnabled bernilai true dari env, jadwalkan ronde awal
+  if (autoScanEnabled && !isBusy && taskQueue.length === 0) {
+    scheduleNextAutoScan();
+  }
 
   while (true) {
     try {
@@ -478,7 +665,7 @@ async function startBot() {
         }
       }
     } catch (e) {
-      // Tunggu 3 detik jika error jaringan
+      // Tunggu 3 detik jika terjadi gangguan jaringan
       await new Promise((r) => setTimeout(r, 3000));
     }
   }
