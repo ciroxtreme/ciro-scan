@@ -1,8 +1,8 @@
 name: Operation Kuras Anthropic Claude
 
 on:
-  schedule:
-    - cron: "0 */2 * * *"  # Rutin sapu dalam tiap 2 jam
+  # schedule:
+  #   - cron: "0 */2 * * *"  # Dinonaktifkan sesuai instruksi Tuan Ciro
   workflow_dispatch:
 
 jobs:
