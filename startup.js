@@ -169,6 +169,12 @@ function getHelpText() {
     '🕵️ <b>5. Mode Dork Global:</b>',
     'Pencarian pola file konfigurasi via Code Search:',
     '👉 Kirim <code>/dork</code> atau <code>dork</code>\n',
+    '🔄 <b>6. Mode Auto-Scan Terus-Menerus (24/7):</b>',
+    '• <code>/auto on</code> — Nyalakan auto-scan non-stop',
+    '• <code>/auto off</code> — Matikan auto-scan',
+    '• <code>/auto feed</code> — Set mode feed publik',
+    '• <code>/auto dork</code> — Set mode dork code search',
+    '• <code>/auto 60</code> — Ubah jeda jeda antar ronde (detik)\n',
     '<b>Perintah Kontrol:</b>',
     '• <code>/status</code> — Cek status pemindaian & antrean',
     '• <code>/stop</code> — Batalkan proses yang sedang berjalan',
@@ -183,12 +189,41 @@ let currentProcess = null;
 let currentTargetLabel = null;
 let taskStartTime = 0;
 
+// Konfigurasi Auto-Scan Loop (Terus-menerus 24/7)
+let autoScanEnabled = (process.env.AUTO_SCAN || '').trim().toLowerCase() === 'true';
+let autoScanMode = (process.env.AUTO_SCAN_MODE || 'feed').trim().toLowerCase();
+let autoScanInterval = parseInt(process.env.AUTO_SCAN_INTERVAL || '60', 10);
+let autoScanTimer = null;
+
+function scheduleNextAutoScan() {
+  if (!autoScanEnabled) return;
+  if (autoScanTimer) clearTimeout(autoScanTimer);
+  console.log(`⏱️ [Auto-Scan] Terjadwal dalam ${autoScanInterval}s (mode: ${autoScanMode})...`);
+  autoScanTimer = setTimeout(() => {
+    if (!autoScanEnabled) return;
+    if (taskQueue.length === 0 && !isBusy) {
+      console.log(`🚀 [Auto-Scan] Memulai ronde otomatis berikutnya: ${autoScanMode}`);
+      sendMessage(ALLOWED_CHAT_ID, `🔄 <b>[Auto-Scan] Ronde Baru:</b> Memulai pemindaian otomatis mode <code>${autoScanMode}</code>...`);
+      taskQueue.push({
+        chatId: ALLOWED_CHAT_ID,
+        targetInput: autoScanMode,
+        searchKw: '',
+        isAuto: true,
+      });
+      processNextTask();
+    }
+  }, autoScanInterval * 1000);
+}
+
 function processNextTask() {
   if (taskQueue.length === 0) {
     isBusy = false;
     currentProcess = null;
     currentTargetLabel = null;
     taskStartTime = 0;
+    if (autoScanEnabled) {
+      scheduleNextAutoScan();
+    }
     return;
   }
 
@@ -229,7 +264,11 @@ function processNextTask() {
       currentProcess = null;
       currentTargetLabel = null;
       taskStartTime = 0;
-      processNextTask();
+      if (taskQueue.length > 0) {
+        processNextTask();
+      } else if (autoScanEnabled) {
+        scheduleNextAutoScan();
+      }
     });
   } catch (err) {
     console.error('❌ Exception saat spawn proses:', err.message);
@@ -237,7 +276,11 @@ function processNextTask() {
     currentProcess = null;
     currentTargetLabel = null;
     taskStartTime = 0;
-    processNextTask();
+    if (taskQueue.length > 0) {
+      processNextTask();
+    } else if (autoScanEnabled) {
+      scheduleNextAutoScan();
+    }
   }
 }
 
@@ -261,7 +304,60 @@ function handleIncomingMessage(msg) {
     return;
   }
 
+  if (lower.startsWith('/auto') || lower.startsWith('/loop')) {
+    const parts = text.split(/\s+/);
+    const sub = parts[1] ? parts[1].toLowerCase() : '';
+    if (sub === 'off' || sub === 'stop') {
+      autoScanEnabled = false;
+      if (autoScanTimer) { clearTimeout(autoScanTimer); autoScanTimer = null; }
+      sendMessage(chatId, '🛑 <b>Auto-Scan Dinonaktifkan.</b> Bot kembali ke mode manual.');
+      return;
+    }
+    if (sub === 'on' || sub === 'start' || !sub) {
+      autoScanEnabled = true;
+      sendMessage(chatId, [
+        '🔄 <b>Auto-Scan Diaktifkan!</b>',
+        `🎯 Mode: <code>${autoScanMode}</code>`,
+        `⏱️ Jeda Antar Ronde: <code>${autoScanInterval}s</code>`,
+        '',
+        '<i>Bot akan memindai secara terus-menerus 24/7 tanpa henti. Ketik <code>/auto off</code> untuk mematikan.</i>',
+      ].join('\n'));
+      if (!isBusy && taskQueue.length === 0) {
+        scheduleNextAutoScan();
+      }
+      return;
+    }
+    if (sub === 'feed' || sub === 'dork') {
+      autoScanMode = sub;
+      autoScanEnabled = true;
+      sendMessage(chatId, `🔄 <b>Auto-Scan diset ke mode:</b> <code>${autoScanMode}</code> (Aktif)`);
+      if (!isBusy && taskQueue.length === 0) {
+        scheduleNextAutoScan();
+      }
+      return;
+    }
+    const num = parseInt(sub, 10);
+    if (!isNaN(num) && num >= 10) {
+      autoScanInterval = num;
+      sendMessage(chatId, `⏱️ <b>Jeda Auto-Scan diubah menjadi:</b> <code>${autoScanInterval} detik</code>.`);
+      return;
+    }
+    sendMessage(chatId, [
+      'ℹ️ <b>Format Perintah Auto-Scan:</b>',
+      '• <code>/auto on</code> — Nyalakan auto-scan terus-menerus (mode feed)',
+      '• <code>/auto off</code> — Matikan auto-scan',
+      '• <code>/auto feed</code> — Set auto-scan mode feed publik',
+      '• <code>/auto dork</code> — Set auto-scan mode dork code search',
+      '• <code>/auto 60</code> — Ubah jeda antar ronde (detik)',
+    ].join('\n'));
+    return;
+  }
+
   if (lower === '/status') {
+    const autoStatus = autoScanEnabled
+      ? `AKTIF (mode: <code>${autoScanMode}</code>, tiap <code>${autoScanInterval}s</code>)`
+      : 'NONAKTIF';
+
     if (isBusy && currentTargetLabel) {
       const dur = Math.round((Date.now() - taskStartTime) / 1000);
       sendMessage(chatId, [
@@ -270,6 +366,7 @@ function handleIncomingMessage(msg) {
         `🔄 <b>Sedang Memindai:</b> <code>${currentTargetLabel}</code>`,
         `⏱️ <b>Durasi:</b> ${dur} detik`,
         `📦 <b>Antrean Menunggu:</b> ${taskQueue.length} tugas`,
+        `🔁 <b>Auto-Scan (24/7):</b> ${autoStatus}`,
       ].join('\n'));
     } else {
       sendMessage(chatId, [
@@ -277,12 +374,19 @@ function handleIncomingMessage(msg) {
         '────────────────────────────',
         '✨ <b>Status:</b> IDLE (Siaga menerima target baru)',
         `📦 <b>Antrean Menunggu:</b> ${taskQueue.length} tugas`,
+        `🔁 <b>Auto-Scan (24/7):</b> ${autoStatus}`,
       ].join('\n'));
     }
     return;
   }
 
   if (lower === '/stop') {
+    if (autoScanEnabled) {
+      autoScanEnabled = false;
+      if (autoScanTimer) { clearTimeout(autoScanTimer); autoScanTimer = null; }
+      sendMessage(chatId, '🛑 <i>Auto-Scan otomatis dinonaktifkan.</i>');
+    }
+
     if (currentProcess && !currentProcess.killed) {
       try {
         currentProcess.kill('SIGTERM');

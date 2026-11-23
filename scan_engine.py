@@ -18,26 +18,54 @@ except ImportError:
     import urllib.error as _url_err
     import json as _json
 
+    class _CaseInsensitiveDict(dict):
+        def __init__(self, data=None):
+            super().__init__()
+            if data:
+                for k, v in data.items():
+                    self[k] = v
+        def __setitem__(self, key, value):
+            super().__setitem__(key.lower(), value)
+        def __getitem__(self, key):
+            return super().__getitem__(key.lower())
+        def get(self, key, default=None):
+            return super().get(key.lower(), default)
+        def __contains__(self, key):
+            return super().__contains__(key.lower())
+
     class _ResponseShim:
-        def __init__(self, code, content):
+        def __init__(self, code, content, headers=None):
             self.status_code = code
             self.content = content
             self.text = content.decode("utf-8", errors="replace")
+            self.headers = _CaseInsensitiveDict(headers or {})
+            self.ok = 200 <= code < 300
         def json(self):
             return _json.loads(self.text)
+        def raise_for_status(self):
+            if 400 <= self.status_code < 600:
+                raise _url_err.HTTPError(None, self.status_code, f"HTTP Error {self.status_code}: {self.text[:200]}", self.headers, None)
 
     class _RequestsShim:
         @staticmethod
-        def get(url, headers=None, timeout=30, **kwargs):
+        def get(url, headers=None, params=None, timeout=30, **kwargs):
+            if params:
+                query_str = _url_parse.urlencode(params)
+                url = f"{url}?{query_str}" if "?" not in url else f"{url}&{query_str}"
             req = _url_req.Request(url, headers=headers or {})
             try:
                 with _url_req.urlopen(req, timeout=timeout) as resp:
-                    return _ResponseShim(resp.getcode(), resp.read())
+                    resp_headers = {k: v for k, v in resp.info().items()}
+                    return _ResponseShim(resp.getcode(), resp.read(), resp_headers)
             except _url_err.HTTPError as e:
-                return _ResponseShim(e.code, e.read())
+                resp_headers = {k: v for k, v in e.info().items()} if e.info() else {}
+                return _ResponseShim(e.code, e.read(), resp_headers)
 
         @staticmethod
-        def post(url, data=None, json=None, headers=None, files=None, timeout=30, **kwargs):
+        def post(url, data=None, json=None, headers=None, files=None, params=None, timeout=30, **kwargs):
+            if params:
+                query_str = _url_parse.urlencode(params)
+                url = f"{url}?{query_str}" if "?" not in url else f"{url}&{query_str}"
             hdrs = dict(headers or {})
             body = None
             if json is not None:
@@ -64,9 +92,11 @@ except ImportError:
             req = _url_req.Request(url, data=body, headers=hdrs, method="POST")
             try:
                 with _url_req.urlopen(req, timeout=timeout) as resp:
-                    return _ResponseShim(resp.getcode(), resp.read())
+                    resp_headers = {k: v for k, v in resp.info().items()}
+                    return _ResponseShim(resp.getcode(), resp.read(), resp_headers)
             except _url_err.HTTPError as e:
-                return _ResponseShim(e.code, e.read())
+                resp_headers = {k: v for k, v in e.info().items()} if e.info() else {}
+                return _ResponseShim(e.code, e.read(), resp_headers)
 
         @staticmethod
         def put(url, data=None, json=None, headers=None, timeout=30, **kwargs):
@@ -78,9 +108,11 @@ except ImportError:
             req = _url_req.Request(url, data=body, headers=hdrs, method="PUT")
             try:
                 with _url_req.urlopen(req, timeout=timeout) as resp:
-                    return _ResponseShim(resp.getcode(), resp.read())
+                    resp_headers = {k: v for k, v in resp.info().items()}
+                    return _ResponseShim(resp.getcode(), resp.read(), resp_headers)
             except _url_err.HTTPError as e:
-                return _ResponseShim(e.code, e.read())
+                resp_headers = {k: v for k, v in e.info().items()} if e.info() else {}
+                return _ResponseShim(e.code, e.read(), resp_headers)
 
     requests = _RequestsShim()
 from concurrent.futures import ThreadPoolExecutor, as_completed
