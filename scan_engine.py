@@ -127,12 +127,12 @@ FEED_MODE = (
 )
 # === [BARU] === Konfigurasi feed (semua via env supaya bisa diatur di workflow)
 FEED_EVENT_PAGES = int(os.getenv("FEED_EVENT_PAGES", "2"))
-FEED_MAX_USERS = int(os.getenv("FEED_MAX_USERS", "50"))
+FEED_MAX_USERS = int(os.getenv("FEED_MAX_USERS", "5"))
 FEED_MAX_REPOS_PER_USER = int(os.getenv("FEED_MAX_REPOS_PER_USER", "3"))
-FEED_MAX_TOTAL_REPOS = int(os.getenv("FEED_MAX_TOTAL_REPOS", "150"))
-REPO_SCAN_TIMEOUT = int(os.getenv("REPO_SCAN_TIMEOUT", "90"))
-CONCURRENCY_WORKERS = int(os.getenv("CONCURRENCY_WORKERS", "3"))
-FEED_FETCH_WORKERS = int(os.getenv("FEED_FETCH_WORKERS", "12"))
+FEED_MAX_TOTAL_REPOS = int(os.getenv("FEED_MAX_TOTAL_REPOS", "100"))
+REPO_SCAN_TIMEOUT = int(os.getenv("REPO_SCAN_TIMEOUT", "300"))
+CONCURRENCY_WORKERS = int(os.getenv("CONCURRENCY_WORKERS", "4"))
+FEED_FETCH_WORKERS = int(os.getenv("FEED_FETCH_WORKERS", "8"))  # fetch repo user paralel
 
 # === [SHARD] === Mode workflow matrix: collect-only / shard-scan / merge-only
 COLLECT_ONLY = os.getenv("COLLECT_ONLY", "").strip().lower() in ("1", "true", "yes")
@@ -152,10 +152,10 @@ DORK_MODE = (
 # List query dipisahkan dengan karakter '|' (pipe), contoh:
 #   DORK_QUERIES: "filename:.npmrc _authToken|filename:.env AWS_SECRET_ACCESS_KEY"
 DORK_QUERIES_RAW = os.getenv("DORK_QUERIES", "").strip()
-DORK_QUERIES_PER_RUN = int(os.getenv("DORK_QUERIES_PER_RUN", "5"))
-DORK_MAX_REPOS = int(os.getenv("DORK_MAX_REPOS", "50"))
+DORK_QUERIES_PER_RUN = int(os.getenv("DORK_QUERIES_PER_RUN", "3"))   # query dijalankan per run (rate limit code search = 10/menit)
+DORK_MAX_REPOS = int(os.getenv("DORK_MAX_REPOS", "15"))              # plafon repo target per run
 DORK_MAX_REPO_SIZE_KB = int(os.getenv("DORK_MAX_REPO_SIZE_KB", "200000"))  # skip repo raksasa (clone lama)
-DORK_QUERY_WORKERS = int(os.getenv("DORK_QUERY_WORKERS", "6"))
+DORK_QUERY_WORKERS = int(os.getenv("DORK_QUERY_WORKERS", "4"))              # query dork jalan paralel (maks 4 bersamaan)
 # Query default kalau env tidak diisi — set aman & terbukti produktif
 DORK_DEFAULT_QUERIES = [
     # === 1. OPENAI ENTERPRISE (sk-proj-) ===
@@ -619,10 +619,7 @@ def collect_targets_from_feed():
         return [], []
 
     # JANGAN di-sorted: urutan dict = urutan pertama ketemu di feed (event terbaru dulu)
-    if FEED_MAX_USERS <= 0 or FEED_MAX_USERS >= len(users_seen):
-        picked_users = list(users_seen.keys())
-    else:
-        picked_users = list(users_seen.keys())[:FEED_MAX_USERS]
+    picked_users = list(users_seen.keys())[:FEED_MAX_USERS]
     print(f"🎯 {len(users_seen)} user aktif terdeteksi, dipicked {len(picked_users)} user: "
           f"{', '.join(picked_users)}")
 
